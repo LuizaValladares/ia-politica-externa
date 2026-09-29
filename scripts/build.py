@@ -1,0 +1,2320 @@
+#!/usr/bin/env python3
+"""
+IA & Política Externa — coletor de notícias internacionais sobre
+inteligência artificial e política externa, com recorte de interesse
+para o Brasil.
+
+Busca feeds RSS/Atom de veículos internacionais, classifica cada matéria
+nos temas de interesse e gera um dashboard estático (public/index.html +
+public/data.json).
+
+Baseado no projeto Embassy Daily News
+(github.com/tacianoz/embassy-daily-news), adaptado para o tema IA e
+política externa.
+
+Usa apenas a biblioteca padrão do Python (sem dependências externas).
+
+Variáveis de ambiente úteis:
+  FEEDS_OVERRIDE  JSON com lista de feeds [{"name","url","themes":[...]}] —
+                  usado para testes locais (aceita caminhos de arquivo).
+  OUTPUT_DIR      diretório de saída (padrão: public).
+  MAX_AGE_DAYS    idade máxima das matérias em dias (padrão: 3).
+"""
+from __future__ import annotations
+
+import html
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+import urllib.error
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from xml.etree import ElementTree as ET
+
+# --------------------------------------------------------------------------- #
+# Configuração de feeds
+#
+# Cada feed pode trazer "themes": uma dica de temas aplicada a TODAS as suas
+# matérias (somada à classificação por palavras-chave). Útil para feeds de
+# seção (ex.: caderno de economia, ciência etc.).
+# --------------------------------------------------------------------------- #
+FEEDS = [
+    # Buscas dedicadas (Google News RSS) — cobrem tópicos que os feeds diretos
+    # não têm seção própria, ou reúnem vários veículos de uma vez. O <source>
+    # de cada item traz o nome real do veículo (filtrado por TRUSTED_OUTLETS).
+    {"name": "Google News — Brasil (IA e política externa)", "url": "https://news.google.com/rss/search?q=Brazil+(%22artificial+intelligence%22+OR+%22foreign+policy%22+OR+diplomacy+OR+Itamaraty)&hl=en-US&gl=US&ceid=US:en", "themes": ["brasil"]},
+    {"name": "Google News — IA: governança e regulação", "url": "https://news.google.com/rss/search?q=(%22artificial+intelligence%22+OR+AI)+(regulation+OR+governance+OR+%22AI+Act%22+OR+%22executive+order%22+OR+policy)&hl=en-US&gl=US&ceid=US:en", "themes": ["ia_governanca"]},
+    {"name": "Google News — IA: cúpulas e segurança global", "url": "https://news.google.com/rss/search?q=%22AI+summit%22+OR+%22AI+safety%22+OR+%22global+AI%22&hl=en-US&gl=US&ceid=US:en", "themes": ["ia_governanca"]},
+    {"name": "Google News — IA: segurança e defesa", "url": "https://news.google.com/rss/search?q=(%22artificial+intelligence%22+OR+AI)+(military+OR+defense+OR+defence+OR+weapons+OR+warfare+OR+drone)&hl=en-US&gl=US&ceid=US:en", "themes": ["ia_seguranca"]},
+    {"name": "Google News — IA: indústria e investimentos", "url": "https://news.google.com/rss/search?q=(%22artificial+intelligence%22+OR+AI)+(funding+OR+investment+OR+startup+OR+billion+OR+valuation)&hl=en-US&gl=US&ceid=US:en", "themes": ["ia_industria"]},
+    {"name": "Google News — Chips e controles de exportação", "url": "https://news.google.com/rss/search?q=(chip+OR+semiconductor+OR+Nvidia)+(export+control+OR+sanctions+OR+China+OR+Taiwan)&hl=en-US&gl=US&ceid=US:en", "themes": ["comercio", "geopolitica"]},
+    {"name": "Google News — Diplomacia e multilateralismo", "url": "https://news.google.com/rss/search?q=(%22United+Nations%22+OR+UN+OR+G7+OR+G20+OR+BRICS)+(summit+OR+diplomacy+OR+resolution+OR+sanctions)&hl=en-US&gl=US&ceid=US:en", "themes": ["diplomacia"]},
+    {"name": "Google News — Geopolítica e grandes potências", "url": "https://news.google.com/rss/search?q=geopolitics+OR+%22great+power+competition%22+OR+%22world+order%22&hl=en-US&gl=US&ceid=US:en", "themes": ["geopolitica"]},
+    {"name": "Google News — Relações EUA-China", "url": "https://news.google.com/rss/search?q=%22United+States%22+China+relations&hl=en-US&gl=US&ceid=US:en", "themes": ["geopolitica"]},
+    {"name": "Google News — Conflitos e segurança internacional", "url": "https://news.google.com/rss/search?q=(war+OR+conflict+OR+ceasefire+OR+%22national+security%22)+international&hl=en-US&gl=US&ceid=US:en", "themes": ["seguranca_internacional"]},
+    # Análise / reflexão estratégica (geopolítica e IA)
+    {"name": "Google News — Análise estratégica", "url": "https://news.google.com/rss/search?q=(geopolitics+OR+%22foreign+policy%22+OR+%22artificial+intelligence%22)+(analysis+OR+opinion+OR+column)&hl=en-US&gl=US&ceid=US:en", "themes": ["opiniao"]},
+    # Buscas por veículo (Reuters/AP/FT não têm mais RSS próprio de graça —
+    # via Google News o <source> continua vindo com o nome real do veículo).
+    {"name": "Google News — via Reuters", "url": "https://news.google.com/rss/search?q=site:reuters.com+(AI+OR+diplomacy+OR+geopolitics)&hl=en-US&gl=US&ceid=US:en", "themes": []},
+    {"name": "Google News — via Associated Press", "url": "https://news.google.com/rss/search?q=site:apnews.com+(AI+OR+diplomacy+OR+geopolitics)&hl=en-US&gl=US&ceid=US:en", "themes": []},
+    {"name": "Google News — via Financial Times", "url": "https://news.google.com/rss/search?q=site:ft.com+(AI+OR+diplomacy)&hl=en-US&gl=US&ceid=US:en", "themes": []},
+    # Feeds de TÓPICO do Google News (curadoria do próprio Google, sem
+    # palavra-chave): agregam vários veículos além dos feeds diretos. Sem
+    # dica de tema — a classificação local (palavras-chave + IA) decide o
+    # que interessa; o resto cai como "sem_tema".
+    {"name": "Google News — Tópico Mundo", "url": "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-US&gl=US&ceid=US:en", "themes": []},
+    {"name": "Google News — Tópico Tecnologia", "url": "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en", "themes": []},
+
+    # --- Especializados em IA (RSS direto) ---
+    {"name": "MIT Technology Review — IA", "url": "https://www.technologyreview.com/topic/artificial-intelligence/feed", "themes": ["ia_modelos"]},
+    {"name": "Wired — IA", "url": "https://www.wired.com/feed/tag/ai/latest/rss", "themes": ["ia_modelos"]},
+    {"name": "TechCrunch — IA", "url": "https://techcrunch.com/category/artificial-intelligence/feed/", "themes": ["ia_industria"]},
+    {"name": "The Verge — IA", "url": "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "themes": ["ia_modelos"]},
+    {"name": "ZDNet — IA", "url": "https://www.zdnet.com/topic/artificial-intelligence/rss.xml", "themes": ["ia_industria"]},
+    {"name": "VentureBeat — IA", "url": "https://venturebeat.com/category/ai/feed/", "themes": ["ia_industria"]},
+    {"name": "Defense One — Tecnologia", "url": "https://www.defenseone.com/rss/technology/", "themes": ["ia_seguranca"]},
+
+    # --- Política externa e segurança internacional (RSS direto) ---
+    {"name": "Foreign Affairs", "url": "https://www.foreignaffairs.com/rss.xml", "themes": ["diplomacia", "opiniao"]},
+    {"name": "Foreign Policy", "url": "https://foreignpolicy.com/feed/", "themes": ["diplomacia"]},
+    {"name": "The Diplomat", "url": "https://thediplomat.com/feed/", "themes": ["diplomacia", "geopolitica"]},
+    {"name": "War on the Rocks", "url": "https://warontherocks.com/feed/", "themes": ["seguranca_internacional", "opiniao"]},
+    {"name": "Just Security", "url": "https://www.justsecurity.org/feed/", "themes": ["seguranca_internacional", "opiniao"]},
+
+    # --- Grande imprensa internacional (RSS direto) ---
+    {"name": "BBC — Mundo", "url": "http://feeds.bbci.co.uk/news/world/rss.xml", "themes": []},
+    {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml", "themes": []},
+    {"name": "The Economist — Internacional", "url": "https://www.economist.com/international/rss.xml", "themes": []},
+    {"name": "The New York Times — Mundo", "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "themes": []},
+]
+
+# --------------------------------------------------------------------------- #
+# Temas de interesse (ordem definida pelo usuário)
+# --------------------------------------------------------------------------- #
+THEMES = {
+    "brasil": {
+        "label": "Brasil",
+        "desc": "Brasil em IA e política externa: governo, diplomacia, empresas e iniciativas nacionais",
+        "color": "#009c3b",
+        "icon": "🇧🇷",
+        "keywords": [
+            "brazil", "brazilian", "brasil", "brasilia", "brasília", "lula",
+            "itamaraty", "mercosur", "mercosul", "sao paulo", "rio de janeiro",
+            "pbia", "sabia llm", "maritaca ai", "belem", "belém",
+            "cop30", "brazilian government", "brazilian foreign ministry",
+        ],
+    },
+    "ia_governanca": {
+        "label": "IA: Governança e Regulação",
+        "desc": "Regulação, segurança, ética e políticas públicas de inteligência artificial",
+        "color": "#3d4eac",
+        "icon": "⚖️",
+        "keywords": [
+            "ai regulation", "ai act", "ai governance", "ai safety",
+            "ai policy", "ai summit", "responsible ai", "ai ethics",
+            "algorithmic accountability", "ai oversight",
+            "artificial intelligence act", "global ai governance",
+            "ai risk", "frontier model", "ai red lines", "ai executive order",
+            "ai treaty", "un ai", "ai standards", "ai transparency",
+        ],
+    },
+    "ia_modelos": {
+        "label": "IA: Modelos e Pesquisa",
+        "desc": "Modelos, pesquisa e avanços técnicos em inteligência artificial",
+        "color": "#6c5ce7",
+        "icon": "🤖",
+        "keywords": [
+            "artificial intelligence", "large language model", "llm",
+            "generative ai", "chatgpt", "gpt", "claude ai", "gemini ai",
+            "openai", "anthropic", "deepmind", "machine learning",
+            "neural network", "foundation model", "agi",
+            "artificial general intelligence", "ai model", "ai research",
+            "ai breakthrough", "ai lab", "multimodal ai",
+        ],
+    },
+    "ia_industria": {
+        "label": "IA: Indústria e Investimentos",
+        "desc": "Empresas, investimentos, chips e infraestrutura de inteligência artificial",
+        "color": "#e67e22",
+        "icon": "💼",
+        "keywords": [
+            "ai funding", "ai startup", "ai investment", "ai valuation",
+            "ai chip", "nvidia", "data center", "data centre",
+            "compute cluster", "ai infrastructure", "ai market",
+            "ai company", "ai deal", "ai partnership", "ai talent",
+            "semiconductor", "semiconductors",
+        ],
+    },
+    "ia_seguranca": {
+        "label": "IA: Segurança e Defesa",
+        "desc": "Uso militar e de defesa de inteligência artificial, guerra cibernética e segurança nacional",
+        "color": "#475569",
+        "icon": "🛡️",
+        "keywords": [
+            "military ai", "autonomous weapon", "lethal autonomous",
+            "drone warfare", "ai warfare", "cyberwarfare", "cyber attack",
+            "cybersecurity", "defense ai", "defence ai", "pentagon ai",
+            "ai targeting", "killer robot", "algorithmic warfare",
+        ],
+    },
+    "diplomacia": {
+        "label": "Diplomacia e Multilateralismo",
+        "desc": "Diplomacia, relações bilaterais e organismos multilaterais",
+        "color": "#1f3a93",
+        "icon": "🌐",
+        "keywords": [
+            "diplomacy", "diplomatic", "foreign ministry", "foreign minister",
+            "bilateral", "multilateral", "united nations", "un security council",
+            "g7", "g20", "g 20", "brics", "summit", "treaty", "embassy",
+            "ambassador", "foreign policy", "state department",
+            "international relations", "secretary of state",
+        ],
+    },
+    "geopolitica": {
+        "label": "Geopolítica e Grandes Potências",
+        "desc": "Disputas e alinhamentos entre grandes potências, ordem mundial",
+        "color": "#0f7b6c",
+        "icon": "🌍",
+        "keywords": [
+            "geopolitics", "geopolitical", "great power", "world order",
+            "strategic competition", "united states china", "us china",
+            "sino american", "indo pacific", "european union foreign policy",
+            "russia ukraine", "middle east", "nato", "sphere of influence",
+            "strategic autonomy",
+        ],
+    },
+    "seguranca_internacional": {
+        "label": "Conflitos e Segurança Internacional",
+        "desc": "Guerras, conflitos armados e crises de segurança internacional",
+        "color": "#c0392b",
+        "icon": "⚔️",
+        "keywords": [
+            "war", "conflict", "ceasefire", "national security", "terrorism",
+            "insurgency", "peacekeeping", "armed forces", "military operation",
+            "invasion", "airstrike", "missile strike",
+            "security council resolution",
+        ],
+    },
+    "comercio": {
+        "label": "Comércio, Sanções e Exportação",
+        "desc": "Comércio internacional, tarifas, sanções e controles de exportação",
+        "color": "#b8860b",
+        "icon": "📦",
+        "keywords": [
+            "trade war", "tariff", "sanctions", "export control",
+            "export ban", "trade agreement", "supply chain", "chip export",
+            "semiconductor export", "trade deal", "economic sanctions",
+            "decoupling", "de-risking", "critical minerals", "rare earth",
+        ],
+    },
+    "opiniao": {
+        "label": "Opiniões & Análises",
+        "desc": "Artigos de opinião, análise e reflexão estratégica",
+        "color": "#8d6e63",
+        "icon": "📝",
+        "keywords": [],  # vem das fontes de opinião/análise (hint), não de keyword
+    },
+}
+
+USER_AGENT = "Mozilla/5.0 (compatible; AIForeignPolicyDashboard/1.0)"
+
+# Veículos internacionais de referência reconhecidos. Resultados de buscas
+# agregadas (Google News) só entram se a fonte estiver nesta lista — evita
+# ruído de blogs/sites desconhecidos. Feeds diretos (abaixo) não passam por
+# este filtro: só as buscas agregadas do Google News precisam dele.
+TRUSTED_OUTLETS = [
+    # Agências e grande imprensa internacional
+    "reuters", "associated press", "ap news", "bloomberg", "afp",
+    "agence france presse", "the new york times", "new york times",
+    "the washington post", "washington post", "the wall street journal",
+    "wall street journal", "financial times", "the guardian", "guardian",
+    "the economist", "economist", "bbc", "cnn", "npr", "the atlantic",
+    "atlantic", "time", "axios", "politico", "the hill", "vox", "usa today",
+    "the times", "the telegraph", "le monde", "der spiegel",
+    "the japan times", "nikkei", "nikkei asia", "south china morning post",
+    "scmp", "asia times", "euractiv", "deutsche welle", "dw news",
+    # Política externa, defesa e segurança internacional (especializados)
+    "foreign affairs", "foreign policy", "the diplomat", "war on the rocks",
+    "just security", "lawfare", "council on foreign relations", "cfr",
+    "carnegie endowment", "carnegie", "brookings", "rand corporation",
+    "chatham house", "center for strategic and international studies",
+    "csis", "atlantic council", "world politics review", "defense one",
+    "defense news", "breaking defense", "the national interest",
+    "stimson center", "united states institute of peace", "usip", "gzero",
+    "eurasia group", "responsible statecraft", "al jazeera",
+    # Tecnologia e IA (especializados)
+    "mit technology review", "wired", "techcrunch", "the verge",
+    "ars technica", "zdnet", "venturebeat", "the information", "semafor",
+    "ieee spectrum", "engadget", "cnbc", "business insider", "quartz",
+    "nature", "protocol", "fast company", "recode",
+]
+
+# Veículos de grande circulação — recebem prioridade na ordenação e destaque.
+PRIORITY_OUTLETS = [
+    "reuters", "associated press", "bloomberg", "financial times",
+    "the economist", "foreign affairs", "foreign policy",
+    "mit technology review", "the new york times", "the washington post",
+    "the wall street journal", "bbc",
+]
+
+def matches_outlet(source: str, tokens: list[str]) -> bool:
+    blob = normalize(source)
+    return any((" " + t + " ") in blob for t in tokens)
+
+
+def is_trusted(source: str) -> bool:
+    return matches_outlet(source, TRUSTED_OUTLETS)
+
+
+# Unifica variações do nome do mesmo veículo (ex.: "AP News" e "Associated
+# Press") — para o filtro de veículos e a exibição nos cards. Ordem importa:
+# tokens mais específicos primeiro.
+CANONICAL_SOURCES = [
+    ("The New York Times", "new york times"),
+    ("The Washington Post", "washington post"),
+    ("The Wall Street Journal", "wall street journal"),
+    ("Financial Times", "financial times"),
+    ("The Guardian", "guardian"),
+    ("The Economist", "economist"),
+    ("Associated Press", "associated press"), ("Associated Press", "ap news"),
+    ("Reuters", "reuters"),
+    ("Bloomberg", "bloomberg"),
+    ("BBC", "bbc"),
+    ("CNN", "cnn"),
+    ("NPR", "npr"),
+    ("The Atlantic", "atlantic"),
+    ("Axios", "axios"),
+    ("Politico", "politico"),
+    ("Foreign Affairs", "foreign affairs"),
+    ("Foreign Policy", "foreign policy"),
+    ("The Diplomat", "the diplomat"),
+    ("War on the Rocks", "war on the rocks"),
+    ("Just Security", "just security"),
+    ("Lawfare", "lawfare"),
+    ("Council on Foreign Relations", "council on foreign relations"),
+    ("Council on Foreign Relations", "cfr"),
+    ("Carnegie Endowment", "carnegie endowment"), ("Carnegie Endowment", "carnegie"),
+    ("Brookings Institution", "brookings"),
+    ("RAND Corporation", "rand corporation"),
+    ("Chatham House", "chatham house"),
+    ("CSIS", "center for strategic and international studies"), ("CSIS", "csis"),
+    ("Atlantic Council", "atlantic council"),
+    ("World Politics Review", "world politics review"),
+    ("Defense One", "defense one"),
+    ("Defense News", "defense news"),
+    ("Breaking Defense", "breaking defense"),
+    ("Al Jazeera", "al jazeera"),
+    ("MIT Technology Review", "mit technology review"),
+    ("Wired", "wired"),
+    ("TechCrunch", "techcrunch"),
+    ("The Verge", "the verge"),
+    ("Ars Technica", "ars technica"),
+    ("ZDNet", "zdnet"),
+    ("VentureBeat", "venturebeat"),
+    ("The Information", "the information"),
+    ("Semafor", "semafor"),
+    ("IEEE Spectrum", "ieee spectrum"),
+    ("South China Morning Post", "south china morning post"), ("South China Morning Post", "scmp"),
+    ("Nikkei Asia", "nikkei asia"), ("Nikkei Asia", "nikkei"),
+    ("CNBC", "cnbc"),
+    ("Asia Times", "asia times"),
+    ("The Japan Times", "the japan times"), ("The Japan Times", "japan times"),
+    ("The Hill", "the hill"),
+    ("Business Insider", "business insider"),
+    ("Quartz", "quartz"),
+]
+
+# Sufixos de domínio que aparecem em alguns nomes de fonte do Google News.
+_SRC_SUFFIX_RE = re.compile(r"(?i)\.(com|in|org|net|co\.in)\b")
+
+
+def canonical_source(name: str) -> str:
+    blob = normalize(name)
+    for display, token in CANONICAL_SOURCES:
+        if (" " + token + " ") in blob:
+            return display
+    # Fallback: remove sufixo de domínio (.com/.in/...) para unificar
+    # pequenas variações sem regra explícita.
+    return _SRC_SUFFIX_RE.sub("", name).strip()
+
+
+def is_priority(source: str) -> bool:
+    return matches_outlet(source, PRIORITY_OUTLETS)
+
+
+# Sinalizadores de Brasil sem a palavra "Brazil"/"Brasil" no texto (ex.:
+# nomes de instituições/iniciativas): a matéria SEMPRE recebe a tag "brasil"
+# (mesmo que a IA não a inclua na recategorização).
+BRAZIL_SIGNALS = [
+    "itamaraty", "pbia", "plano brasileiro de inteligencia artificial",
+    "sabia llm", "maritaca ai", "brazilian foreign ministry",
+    "brazilian ministry of foreign affairs",
+]
+
+
+def mentions_brazil_signal(text: str) -> bool:
+    return matches_outlet(text, BRAZIL_SIGNALS)
+
+
+# Boletins/roundups recorrentes e tickers — ruído. Matérias com esses padrões
+# no título são DESCARTADAS (não entram na seleção).
+JUNK_TITLE = [
+    "market update", "market wrap", "market roundup", "market round up",
+    "closing bell", "opening bell", "share market live", "stock market live",
+    "sensex today", "nifty today", "gold rate today", "silver rate today",
+    "petrol and diesel price", "fuel price today", "price today",
+    "rate today", "horoscope", "rashifal", "daily briefing",
+]
+
+
+def is_junk_title(title: str) -> bool:
+    blob = normalize(title)
+    return any(p in blob for p in JUNK_TITLE)
+
+
+def is_english(text: str) -> bool:
+    """Descarta títulos em scripts índicos (hindi/devanagari, bengali, tâmil,
+    telugu, etc.). O monitor exibe só matérias em inglês."""
+    indic = sum(1 for ch in (text or "") if 0x0900 <= ord(ch) <= 0x0DFF)
+    return indic < 4
+
+# --------------------------------------------------------------------------- #
+# Utilidades
+# --------------------------------------------------------------------------- #
+_norm_re = re.compile(r"[^a-z0-9]+")
+
+
+def normalize(text: str) -> str:
+    """Minúsculas + remoção de pontuação, mantendo espaços simples nas bordas."""
+    text = html.unescape(text or "")
+    text = text.lower()
+    text = _norm_re.sub(" ", text)
+    return " " + text.strip() + " "
+
+
+def strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text or "")
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# UA de navegador para baixar PÁGINAS DE ARTIGO (portais costumam bloquear
+# UAs de bot); os feeds RSS continuam com o USER_AGENT identificado (educado).
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def fetch(url: str, timeout: int = 20, ua: str | None = None) -> bytes | None:
+    """Busca uma URL (ou lê um arquivo local, para testes)."""
+    if not url.startswith(("http://", "https://")):
+        try:
+            with open(url, "rb") as fh:
+                return fh.read()
+        except OSError as exc:
+            print(f"  ! erro ao ler arquivo {url}: {exc}", file=sys.stderr)
+            return None
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": ua or USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            # 4xx (404/403/410): erro de cliente — não adianta repetir.
+            if 400 <= exc.code < 500:
+                print(f"  ! {exc.code} {url}", file=sys.stderr)
+                return None
+            last_err = exc
+        except Exception as exc:  # noqa: BLE001 — toleramos falhas de rede
+            last_err = exc
+    print(f"  ! falhou ({last_err}): {url}", file=sys.stderr)
+    return None
+
+
+def _localname(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _find_text(elem, names) -> str:
+    for child in elem:
+        if _localname(child.tag) in names:
+            if child.text and child.text.strip():
+                return child.text.strip()
+            # Atom: link como atributo href
+            href = child.attrib.get("href")
+            if href:
+                return href.strip()
+    return ""
+
+
+def _find_link(elem) -> str:
+    # RSS: <link>texto</link>; Atom: <link href=... rel="alternate"/>
+    fallback = ""
+    for child in elem:
+        if _localname(child.tag) != "link":
+            continue
+        rel = child.attrib.get("rel", "alternate")
+        href = child.attrib.get("href")
+        if href and rel == "alternate":
+            return href.strip()
+        if href and not fallback:
+            fallback = href.strip()
+        if child.text and child.text.strip():
+            return child.text.strip()
+    return fallback
+
+
+def parse_date(value: str):
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (TypeError, ValueError, IndexError):
+        pass
+    try:
+        iso = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def parse_feed(raw: bytes, source: str) -> list[dict]:
+    items: list[dict] = []
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as exc:
+        print(f"  ! XML inválido em {source}: {exc}", file=sys.stderr)
+        return items
+
+    # Localiza entradas: RSS (<item>) ou Atom (<entry>)
+    entries = [e for e in root.iter() if _localname(e.tag) in ("item", "entry")]
+    for entry in entries:
+        title = _find_text(entry, ("title",))
+        link = _find_link(entry)
+        summary = _find_text(entry, ("description", "summary", "content", "encoded"))
+        date_raw = _find_text(entry, ("pubDate", "published", "updated", "date"))
+        # Google News inclui <source>Veículo</source> em cada item
+        item_source = _find_text(entry, ("source",))
+        if not title or not link:
+            continue
+        items.append({
+            "title": strip_html(title),
+            "link": link,
+            "summary": strip_html(summary),
+            "published": parse_date(date_raw),
+            "source": source,
+            "outlet": strip_html(item_source) if item_source else "",
+        })
+    return items
+
+
+_TITLE_STOP = {
+    "the", "and", "for", "with", "says", "after", "over", "amid", "into",
+    "from", "that", "this", "are", "was", "will", "has", "have", "its", "new",
+    "out", "how", "why", "what", "who", "his", "her", "their", "more", "than",
+    "first", "second", "third", "report", "amid", "ahead", "year", "day",
+}
+
+
+def title_tokens(title: str) -> set:
+    """Conjunto de palavras significativas do título (para detectar quase-dups)."""
+    return {t for t in normalize(title).split()
+            if len(t) >= 3 and t not in _TITLE_STOP}
+
+
+def titles_similar(a: set, b: set) -> bool:
+    """True se dois títulos provavelmente são a MESMA notícia (veículos
+    diferentes, manchetes diferentes)."""
+    if len(a) < 4 or len(b) < 4:
+        return False
+    inter = len(a & b)
+    jaccard = inter / len(a | b)
+    containment = inter / min(len(a), len(b))
+    return jaccard >= 0.6 or containment >= 0.8
+
+
+def classify(item: dict, hint_themes: list[str]) -> list[str]:
+    blob = normalize(item["title"] + " " + item["summary"])
+    matched = set(hint_themes)
+    for key, cfg in THEMES.items():
+        for kw in cfg["keywords"]:
+            needle = " " + normalize(kw).strip() + " "
+            if needle in blob:
+                matched.add(key)
+                break
+    # mantém a ordem canônica dos temas
+    return [k for k in THEMES if k in matched]
+
+
+# --------------------------------------------------------------------------- #
+# Geração do HTML
+# --------------------------------------------------------------------------- #
+def render_html(payload: dict, day_menu: list[dict] | None = None) -> str:
+    theme_meta = {k: {"label": v["label"], "desc": v["desc"],
+                      "color": v["color"], "icon": v["icon"]}
+                  for k, v in THEMES.items()}
+    data_json = json.dumps(
+        {"meta": payload["meta"], "themes": theme_meta,
+         "articles": payload["articles"], "highlights": payload.get("highlights", []),
+         "narratives": payload.get("narratives")},
+        ensure_ascii=False,
+    )
+
+    # CSS para as faixas coloridas de cada tema
+    theme_css = "\n".join(
+        f'    .t-{k} {{ --tc: {v["color"]}; }}' for k, v in THEMES.items()
+    )
+
+    # Menuzinho de dias (Hoje / Ontem / Anteontem) — aparece já no 1º dia
+    # (só "Hoje") e cresce conforme o histórico acumula.
+    menu_html = ""
+    if day_menu:
+        links = "".join(
+            f'<a class="day{" active" if d["active"] else ""}" href="{d["file"]}">{html.escape(d["label"])}</a>'
+            for d in day_menu)
+        menu_html = f'<div class="daymenu">{links}</div>'
+
+    return (TEMPLATE.replace("/*THEME_CSS*/", theme_css)
+            .replace("<!--DAY_MENU-->", menu_html)
+            .replace("/*DATA_JSON*/", data_json))
+
+
+def render_diag(diag: dict, themes: dict) -> str:
+    """Página de diagnóstico/log do run (para auditar a curadoria e melhorar)."""
+    def esc(s):
+        return html.escape(str(s), quote=True)
+
+    def li_articles(items):
+        out = []
+        for a in items:
+            sc = a["score"] if a["score"] is not None else "—"
+            tg = ", ".join(a["temas"])
+            res = f' <span class="r">— {esc(a["resumo"])}</span>' if a["resumo"] else ""
+            out.append(f'<li><b>{esc(sc)}</b> · {esc(a["fonte"])} · <span class="t">{esc(tg)}</span><br>{esc(a["titulo"])}{res}</li>')
+        return "".join(out) or "<li>(vazio)</li>"
+
+    feeds_rows = "".join(
+        f'<tr class="{"ok" if f["ok"] else "fail"}"><td>{esc(f["feed"])}</td>'
+        f'<td>{"ok" if f["ok"] else "sem resposta"}</td>'
+        f'<td>{f["itens"]}</td><td>{f["mantidas"]}</td>'
+        f'<td class="d">{esc(", ".join(f"{k}:{v}" for k, v in f.get("descartes", {}).items()))}</td></tr>'
+        for f in diag["feeds"]
+    )
+    secs = "".join(
+        f'<h3>{esc(themes[k]["icon"])} {esc(themes[k]["label"])}</h3><ol class="arts">{li_articles(v)}</ol>'
+        for k, v in diag["secoes"].items() if v
+    )
+    t = diag["totais"]; ia = diag["ia"]
+    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnóstico do run — {esc(diag["gerado"])}</title>
+<style>
+ body{{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:1000px;margin:0 auto;padding:20px;background:#0e1117;color:#e6edf3;line-height:1.5}}
+ h1{{font-size:20px}} h2{{font-size:16px;margin-top:28px;border-bottom:1px solid #232a35;padding-bottom:6px}}
+ h3{{font-size:14px;margin:16px 0 6px;color:#9aa4b2}}
+ .box{{background:#161b22;border:1px solid #232a35;border-radius:10px;padding:12px 16px;margin:10px 0}}
+ table{{width:100%;border-collapse:collapse;font-size:13px}} td,th{{text-align:left;padding:4px 8px;border-bottom:1px solid #232a35}}
+ tr.fail{{color:#f87171}} ol.arts,ul{{padding-left:20px;font-size:13px}} li{{margin:6px 0}}
+ .t{{color:#6c8cff}} .r{{color:#9aa4b2}} a{{color:#58a6ff}} td.d{{color:#9aa4b2;font-size:12px}}
+</style></head><body>
+<h1>🔎 Diagnóstico do run · {esc(diag["gerado"])}</h1>
+<div class="box">Janela: <b>{t and esc(diag["janela_h"])}h</b> · Matérias: <b>{esc(t["materias"])}</b> ·
+ Fontes: <b>{esc(t["fontes"])}</b> · IA: <b>{"curadoria ativa" if ia["curadoria"] else "heurístico (sem IA)"}</b> ·
+ Pontuadas pela IA: <b>{esc(ia["pontuadas"])}</b> · Removidas (recategorização): <b>{esc(t["removidas_recategorizacao"])}</b>
+ · <a href="index.html">← painel</a> · <a href="diag.json">JSON</a></div>
+<h2>✨ Destaques escolhidos (curadoria)</h2><ol class="arts">{li_articles(diag["destaques"])}</ol>
+<h2>📊 Topo por seção</h2>{secs}
+<h2>📡 Feeds ({sum(1 for f in diag["feeds"] if f["ok"])}/{len(diag["feeds"])} responderam)</h2>
+<div class="box"><table><tr><th>Feed</th><th>status</th><th>itens</th><th>mantidas</th><th>descartes (motivo)</th></tr>{feeds_rows}</table></div>
+</body></html>"""
+
+
+TEMPLATE = r"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IA & Política Externa — Ministério das Relações Exteriores</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23009c3b'/%3E%3Cpath d='M16 4 L30 16 L16 28 L2 16 Z' fill='%23ffdf00'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23002776'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f4f6fb; --card: #ffffff; --ink: #1a1f36; --muted: #6b7280;
+    --line: #e6e9f0; --brand: #ff9933; --brand2: #138808; --accent: #1f3a93;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 8px 24px rgba(16,24,40,.06);
+    --radius: 16px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1117; --card: #161b22; --ink: #e6edf3; --muted: #9aa4b2;
+      --line: #232a35; --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5; -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px; }
+
+  header.top {
+    background: #15224c;
+    border-bottom: 4px solid transparent;
+    border-image: linear-gradient(90deg, #1e9e3e 0 33.33%, #ffd200 33.33% 66.66%, #2b3a8f 66.66% 100%) 1;
+  }
+  .top-inner { padding: 22px 20px 20px; }
+  .brandline { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; }
+  .logo-svg { height: 92px; width: auto; display: block; flex: 0 0 auto; overflow: visible; }
+  h1 { margin: 0; font-size: clamp(22px, 3.4vw, 32px); font-weight: 800; color: #fff; letter-spacing: .3px; }
+  .subtitle { margin: 5px 0 0; color: rgba(255,255,255,.82); font-weight: 500; }
+  .stats { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 16px; font-size: 13px; color: rgba(255,255,255,.78); }
+  .stats b { color: #fff; }
+  .daymenu { display: flex; gap: 6px; margin-top: 12px; }
+  .daymenu .day { text-decoration: none; color: rgba(255,255,255,.85);
+    border: 1px solid rgba(255,255,255,.25); border-radius: 999px;
+    padding: 4px 12px; font-size: 12.5px; font-weight: 700; }
+  .daymenu .day.active { background: #fff; color: #15224c; border-color: #fff; }
+
+  .controls { position: -webkit-sticky; position: sticky; top: 0; z-index: 50;
+    background: var(--bg); border-bottom: 1px solid var(--line); padding: 12px 0;
+    backdrop-filter: blur(6px); box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+  .controls-inner { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .search {
+    flex: 1 1 240px; min-width: 200px; display: flex; align-items: center; gap: 8px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 999px;
+    padding: 9px 16px; box-shadow: var(--shadow);
+  }
+  .search input { border: 0; outline: 0; background: transparent; color: var(--ink);
+    width: 100%; font-size: 14px; }
+  .srcpick {
+    display: flex; align-items: center; gap: 8px; background: var(--card);
+    border: 1px solid var(--line); border-radius: 999px; padding: 8px 14px;
+    box-shadow: var(--shadow); flex: 0 1 auto;
+  }
+  .srcpick select { border: 0; outline: 0; background: transparent; color: var(--ink);
+    font-size: 14px; font-weight: 600; max-width: 200px; cursor: pointer; }
+
+  .chips { display: flex; gap: 5px; flex-wrap: wrap; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+    padding: 6px 13px; border-radius: 999px; font-size: 13.5px; font-weight: 600;
+    box-shadow: var(--shadow); transition: transform .08s ease, border-color .15s ease;
+  }
+  .chip:hover { transform: translateY(-1px); }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--cc, #999); }
+  .chip .count { color: var(--muted); font-weight: 600; font-size: 11.5px; opacity: .85; }
+  .chip.active { background: var(--cc, var(--accent)); border-color: transparent; color: #fff; }
+  .chip.active .dot { box-shadow: 0 0 0 2px rgba(255,255,255,.6); }
+  .chip.active .count { color: rgba(255,255,255,.85); }
+
+  main { padding: 22px 0 60px; }
+  .sec-title { font-size: 17px; font-weight: 800; margin: 8px 0 16px; display: flex; align-items: center; gap: 10px; }
+  .sec-title[hidden] { display: none; }
+  .sec-inline { grid-column: 1 / -1; font-size: 17px; font-weight: 800;
+    margin: 8px 0 0; display: flex; align-items: center; gap: 10px; }
+  .sec-tag { font-size: 11px; font-weight: 700; color: #fff; background: #c2185b;
+    padding: 3px 9px; border-radius: 999px; text-transform: uppercase; letter-spacing: .3px; }
+  .ai-mark { font-size: 10.5px; font-weight: 700; color: #c2185b; }
+  .hl-mark { font-size: 12px; color: #c2185b; }
+  img.emoji { height: 1em; width: 1em; margin: 0 .05em 0 .1em; vertical-align: -0.1em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 0; overflow: hidden; display: flex; flex-direction: column;
+    transition: transform .1s ease, box-shadow .15s ease;
+  }
+  .card:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(16,24,40,.12); }
+  .card .bar { height: 4px; background: var(--tc, var(--accent)); }
+  .card .body { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 10px; height: 100%; }
+  .card .meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .source { font-weight: 700; color: var(--ink); }
+  .source.pri::before { content: "★ "; color: #f5b301; }
+  .card.is-hl { border-left: 3px solid #c2185b; }
+  .card h3 { margin: 0; font-size: 16px; line-height: 1.35; font-weight: 700; }
+  .card h3 a { text-decoration: none; }
+  .card h3 a:hover { text-decoration: underline; }
+  .card p.sum { margin: 0; color: var(--muted); font-size: 13.5px;
+    display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 6px; }
+  .badge { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 999px;
+    color: #fff; background: var(--bc, #555); white-space: nowrap; }
+  .read { margin-top: 4px; font-size: 13px; font-weight: 700; color: var(--tc, var(--accent)); text-decoration: none; }
+  .read:hover { text-decoration: underline; }
+
+  .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
+
+  /* Narrativas do dia — painéis analíticos de largura total */
+  .narr { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 14px; }
+  .narr-quadro { background: linear-gradient(135deg, #15224c, #24397e); color: #fff;
+    border-radius: var(--radius); padding: 18px 22px; font-size: 15px;
+    line-height: 1.7; box-shadow: var(--shadow); }
+  .narr-quadro .k { font-size: 11px; font-weight: 800; letter-spacing: .8px;
+    text-transform: uppercase; color: rgba(255,255,255,.65); display: block;
+    margin-bottom: 6px; }
+  /* Briefing numerado: número grande na cor do tema, fatos escaneáveis */
+  .narr-list { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 14px; }
+  .nn { background: var(--card); border: 1px solid var(--line);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 16px 20px 14px 18px; display: grid;
+    grid-template-columns: 52px 1fr; column-gap: 14px; row-gap: 2px;
+    position: relative; overflow: hidden; }
+  .nn::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+    width: 4px; background: var(--nc, #c2185b); }
+  .nn .num { grid-column: 1; grid-row: 1 / span 8; font-size: 34px;
+    font-weight: 800; color: var(--nc, #c2185b); opacity: .9; line-height: 1;
+    padding-top: 3px; font-variant-numeric: tabular-nums; }
+  .nn > :not(.num) { grid-column: 2; }
+  .nn .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .nn .head h3 { margin: 0; font-size: 16.5px; line-height: 1.3; }
+  .nn .head .badges { margin: 0; }
+  .nn .sint { font-size: 12.5px; color: var(--muted); font-style: italic;
+    margin: 2px 0 4px; }
+  .nn .txt { margin: 4px 0 2px; line-height: 1.6; font-size: 13.5px; }
+  /* Coluna única: leitura de cima para baixo, sem "espalhar" os fatos */
+  .nn .facts { display: flex; flex-direction: column; gap: 7px;
+    margin: 7px 0 2px; max-width: 80ch; }
+  .nn .fact { position: relative; padding-left: 16px; font-size: 13.5px;
+    line-height: 1.55; }
+  .nn .fact::before { content: ""; position: absolute; left: 1px; top: .52em;
+    width: 7px; height: 7px; border-radius: 2px; background: var(--nc, #c2185b); }
+  /* Fontes: manchete visível (uma por linha, com reticências), sem ter que
+     clicar para descobrir o que é cada link */
+  .nn .foot { display: flex; flex-direction: column; gap: 3px; margin-top: 9px;
+    border-top: 1px dashed var(--line); padding-top: 8px; min-width: 0; }
+  .nn .foot a { font-size: 12px; color: var(--muted); text-decoration: none;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 100%; }
+  .nn .foot a:hover { color: var(--ink); text-decoration: underline; }
+  .nn .foot .s { font-weight: 700; color: var(--nc, #999); }
+  @media (max-width: 640px) {
+    .nn { grid-template-columns: 1fr; padding-left: 16px; }
+    .nn .num { grid-row: auto; font-size: 22px; padding-top: 0; }
+    .nn > :not(.num) { grid-column: 1; }
+  }
+  footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 12.5px; padding: 24px 0 50px; }
+  footer .wrap { display: flex; flex-direction: column; gap: 6px; }
+
+  /* ---- Mobile: cabeçalho e filtros mais compactos ---- */
+  @media (max-width: 640px) {
+    .top-inner { padding: 14px 16px 12px; }
+    .brandline { gap: 12px; }
+    .logo-svg { height: 54px; }
+    h1 { font-size: 20px; }
+    .subtitle { font-size: 11.5px; margin-top: 3px; }
+    .stats { gap: 12px; margin-top: 9px; font-size: 11.5px; }
+    .controls { padding: 8px 0; }
+    .controls-inner { gap: 8px; }
+    .search { flex: 1 1 100%; order: 1; padding: 8px 14px; }
+    .srcpick { flex: 1 1 100%; order: 2; padding: 7px 12px; }
+    .srcpick select { max-width: 100%; width: 100%; }
+    /* chips numa única linha, com rolagem horizontal (não quebram a tela) */
+    .chips { order: 3; width: 100%; flex-wrap: nowrap; overflow-x: auto;
+      -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-bottom: 2px; }
+    .chips::-webkit-scrollbar { display: none; }
+    .chip { flex: 0 0 auto; }
+    .grid { grid-template-columns: 1fr; }
+  }
+/*THEME_CSS*/
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-inner">
+    <div class="brandline">
+      <svg class="logo-svg" viewBox="0 0 440 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ministério das Relações Exteriores — Itamaraty">
+        <text x="220" y="60" text-anchor="middle" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600" letter-spacing=".5">MINISTÉRIO DAS RELAÇÕES EXTERIORES</text>
+        <text x="220" y="166" text-anchor="middle" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="70" font-weight="800" letter-spacing="1">ITAMARATY</text>
+        <rect x="74" y="188" width="97" height="11" fill="#1e9e3e"/>
+        <rect x="171" y="188" width="97" height="11" fill="#ffd200"/>
+        <rect x="268" y="188" width="98" height="11" fill="#2b3a8f"/>
+        <text x="220" y="252" text-anchor="middle" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="700" letter-spacing="8">DCTEC</text>
+      </svg>
+      <div class="titles">
+        <h1>IA & Política Externa</h1>
+        <p class="subtitle">Monitor diário de Inteligência Artificial e Política Externa · Ministério das Relações Exteriores — DCTEC</p>
+      </div>
+    </div>
+    <div class="stats">
+      <span><b id="stat-total">0</b> matérias</span>
+      <span><b id="stat-sources">0</b> fontes</span>
+      <span>Atualizado em <b id="stat-updated">—</b></span>
+    </div>
+    <!--DAY_MENU-->
+  </div>
+</header>
+
+<div class="controls">
+  <div class="wrap controls-inner">
+    <label class="search">
+      <span aria-hidden="true">🔎</span>
+      <input id="q" type="search" placeholder="Buscar por palavra-chave, assunto…" autocomplete="off">
+    </label>
+    <label class="srcpick">
+      <span aria-hidden="true">📰</span>
+      <select id="src"><option value="all">Todos os jornais</option></select>
+    </label>
+    <div class="chips" id="chips"></div>
+  </div>
+</div>
+
+<main class="wrap">
+  <h2 class="sec-title" id="view-title" hidden></h2>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" hidden>Nenhuma matéria encontrada para este filtro.</div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>Gerado automaticamente via GitHub Actions • As manchetes e resumos são exibidos no idioma original (inglês). • <a href="diag.html" style="color:inherit;text-decoration:underline">🔎 diagnóstico do run</a></div>
+    <div id="sources-list"></div>
+  </div>
+</footer>
+
+<script id="payload" type="application/json">/*DATA_JSON*/</script>
+<script src="https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/dist/twemoji.min.js" crossorigin="anonymous"></script>
+<script>
+(function () {
+  // Renderiza emojis (inclusive bandeiras 🇧🇷/🇮🇳, que o Windows não desenha)
+  // como imagens via Twemoji. Degrada para emoji nativo se o CDN falhar.
+  function parseEmoji(el) {
+    try { if (window.twemoji) twemoji.parse(el, { folder: 'svg', ext: '.svg' }); } catch (e) {}
+  }
+  const DATA = JSON.parse(document.getElementById('payload').textContent);
+  const THEMES = DATA.themes;
+  const articles = DATA.articles;
+  const HL = DATA.highlights || [];
+  const NARR = (DATA.narratives && (DATA.narratives.itens || []).length) ? DATA.narratives : null;
+  const hlLinks = new Set(HL.map(a => a.link));
+  let inicio = HL.length > 0;            // página inicial = Narrativas + Destaques
+  const activeThemes = new Set();        // temas selecionados (cumulativos)
+  let activeSource = 'all';
+  let query = '';
+
+  const grid = document.getElementById('grid');
+  const empty = document.getElementById('empty');
+  const chipsEl = document.getElementById('chips');
+  const srcEl = document.getElementById('src');
+
+  // Estatísticas do cabeçalho
+  document.getElementById('stat-total').textContent = articles.length;
+  const sources = [...new Set(articles.map(a => a.source))].sort((a, b) => a.localeCompare(b));
+  document.getElementById('stat-sources').textContent = sources.length;
+
+  // Seletor de jornal (com contagem por fonte)
+  const srcCounts = {};
+  for (const a of articles) srcCounts[a.source] = (srcCounts[a.source] || 0) + 1;
+  for (const s of sources) {
+    const opt = document.createElement('option');
+    opt.value = s;
+    opt.textContent = s + ' (' + srcCounts[s] + ')';
+    srcEl.appendChild(opt);
+  }
+  srcEl.addEventListener('change', e => { activeSource = e.target.value; render(); });
+  document.getElementById('stat-updated').textContent = DATA.meta.generated_label;
+  document.getElementById('sources-list').textContent =
+    'Veículos nesta edição (' + (DATA.meta.feeds || []).length + '): ' + (DATA.meta.feeds || []).join(' · ');
+
+  // Contagem por tema
+  const counts = { all: articles.length };
+  for (const k in THEMES) counts[k] = 0;
+  for (const a of articles) for (const t of a.themes) counts[t] = (counts[t] || 0) + 1;
+
+  // Chips de filtro: seleção ÚNICA — um tema por vez (não cumulativo)
+  function updateChips() {
+    document.querySelectorAll('.chip').forEach(c => {
+      const k = c.dataset.key;
+      const on = k === 'inicio' ? inicio
+        : k === 'all' ? (!inicio && activeThemes.size === 0)
+        : (!inicio && activeThemes.has(k));
+      c.classList.toggle('active', on);
+    });
+  }
+  function makeChip(key, label, color, count) {
+    const el = document.createElement('button');
+    el.className = 'chip';
+    el.dataset.key = key;
+    if (color) el.style.setProperty('--cc', color);
+    el.innerHTML =
+      (color ? '<span class="dot" style="background:' + color + '"></span>' : '') +
+      '<span>' + label + '</span><span class="count">' + count + '</span>';
+    el.addEventListener('click', () => {
+      if (key === 'inicio') { inicio = true; activeThemes.clear(); }
+      else if (key === 'all') { inicio = false; activeThemes.clear(); }
+      else {
+        inicio = false;
+        // Seleção única: clicar troca o tema; clicar no ativo volta a "Todos".
+        if (activeThemes.has(key)) activeThemes.clear();
+        else { activeThemes.clear(); activeThemes.add(key); }
+      }
+      updateChips();
+      render();
+      // Ao trocar de filtro, volta a rolagem ao topo. Rolagem INSTANTÂNEA
+      // (não 'smooth'): o render() reconstrói a grade e muda a altura da
+      // página no mesmo instante, o que cancela a animação suave no desktop.
+      // Cobre window + documentElement + body por robustez entre navegadores.
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    });
+    return el;
+  }
+  if (HL.length) chipsEl.appendChild(makeChip('inicio', '🏠 Início', '#c2185b', HL.length));
+  chipsEl.appendChild(makeChip('all', 'Todos', '', counts.all));
+  for (const k in THEMES) {
+    chipsEl.appendChild(makeChip(k, THEMES[k].icon + ' ' + THEMES[k].label, THEMES[k].color, counts[k] || 0));
+  }
+  updateChips();
+
+  function timeAgo(iso) {
+    if (!iso) return '';
+    const d = new Date(iso), now = new Date();
+    const mins = Math.round((now - d) / 60000);
+    if (mins < 60) return 'há ' + Math.max(mins, 1) + ' min';
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return 'há ' + hrs + 'h';
+    const days = Math.round(hrs / 24);
+    return 'há ' + days + (days === 1 ? ' dia' : ' dias');
+  }
+
+  function esc(s) {
+    return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+
+  function cardHTML(a) {
+    const primary = a.themes[0] || 'all';
+    const badges = a.themes.slice(0, 3).map(t =>
+      '<span class="badge" style="--bc:' + THEMES[t].color + '">' + THEMES[t].icon + ' ' + esc(THEMES[t].label) + '</span>'
+    ).join('');
+    const hl = hlLinks.has(a.link) && !inicio;  // marquinha roxa nos filtros
+    return '<article class="card t-' + primary + (hl ? ' is-hl' : '') + '">' +
+      '<div class="bar"></div>' +
+      '<div class="body">' +
+        '<div class="meta">' +
+          (hl ? '<span class="hl-mark" title="Destaque do dia">✦</span>' : '') +
+          '<span class="source' + (a.priority ? ' pri' : '') + '">' + esc(a.source) + '</span>' +
+          (a.time_ago ? '<span>•</span><span>' + esc(a.time_ago) + '</span>' : '') + '</div>' +
+        '<h3><a href="' + esc(a.link) + '" target="_blank" rel="noopener">' + esc(a.title) + '</a></h3>' +
+        (function () {
+          // Resumo em PT (✨) só na página Início; nas seções, o resumo original.
+          const useAi = inicio && a.ai_summary_text;
+          const text = useAi ? a.ai_summary_text : a.summary;
+          return text ? '<p class="sum">' + (useAi ? '<span class="ai-mark">✨ </span>' : '') + esc(text) + '</p>' : '';
+        })() +
+        '<div class="badges">' + badges + '</div>' +
+        '<a class="read" href="' + esc(a.link) + '" target="_blank" rel="noopener">Ler matéria →</a>' +
+      '</div></article>';
+  }
+
+  const viewTitle = document.getElementById('view-title');
+
+  function matchFilters(a) {
+    const q = query.trim().toLowerCase();
+    const okSource = activeSource === 'all' || a.source === activeSource;
+    const okQuery = !q ||
+      a.title.toLowerCase().includes(q) ||
+      (a.summary || '').toLowerCase().includes(q) ||
+      a.source.toLowerCase().includes(q);
+    return okSource && okQuery;
+  }
+
+  // Contadores dos chips acompanham os filtros ativos (origem/jornal/busca):
+  // mostram quantas matérias cada tema tem NA VISÃO atual, não no total bruto.
+  function updateCounts() {
+    const base = articles.filter(matchFilters);
+    const c = { all: base.length };
+    for (const k in THEMES) c[k] = 0;
+    for (const a of base) for (const t of a.themes) c[t] = (c[t] || 0) + 1;
+    document.querySelectorAll('.chip').forEach(ch => {
+      const k = ch.dataset.key;
+      const span = ch.querySelector('.count');
+      if (!span) return;
+      span.textContent = k === 'inicio' ? HL.length : (k === 'all' ? c.all : (c[k] || 0));
+    });
+  }
+
+  function render() {
+    updateCounts();
+    let list;
+    if (inicio) {
+      // Página inicial integrada: Narrativas do dia (síntese analítica) em
+      // cima + Destaques do dia embaixo. Ao buscar/filtrar por jornal, o
+      // bloco de narrativas sai de cena para dar lugar ao resultado.
+      viewTitle.hidden = true;
+      list = HL.filter(matchFilters);
+      const parts = [];
+      const showNarr = NARR && !query.trim() && activeSource === 'all';
+      if (showNarr) {
+        const nColor = n => (n.temas && n.temas[0] && THEMES[n.temas[0]]) ? THEMES[n.temas[0]].color : '#c2185b';
+        const nBadges = n => (n.temas || []).filter(t => THEMES[t]).map(t =>
+          '<span class="badge" style="--bc:' + THEMES[t].color + '">' + THEMES[t].icon + ' ' + esc(THEMES[t].label) + '</span>').join('');
+        parts.push('<div class="narr">' +
+          '<h2 class="sec-inline">🧭 Narrativas do dia <span class="sec-tag">análise por IA</span></h2>' +
+          (NARR.quadro ? '<div class="narr-quadro"><span class="k">Quadro geral do dia</span>' + esc(NARR.quadro) + '</div>' : '') +
+          '</div>');
+        parts.push('<div class="narr-list">' + NARR.itens.map((n, ni) => {
+          // Fontes com preview da manchete (senão o leitor tem que clicar
+          // uma a uma para descobrir o que é cada link)
+          const pills = (n.materias || []).map(m =>
+            '<a href="' + esc(m.link) + '" target="_blank" rel="noopener">' +
+            '<span class="s">' + esc(m.source || 'fonte') + '</span> · ' + esc(m.title) + '</a>').join('');
+          // Briefing: fatos-chave escaneáveis quando o aprofundamento rodou;
+          // senão, o texto corrido da identificação (fallback).
+          const body = (n.pontos && n.pontos.length)
+            ? '<div class="facts">' + n.pontos.map(p => '<div class="fact">' + esc(p) + '</div>').join('') + '</div>'
+            : (n.texto ? '<p class="txt">' + esc(n.texto) + '</p>' : '');
+          return '<article class="nn" style="--nc:' + nColor(n) + '">' +
+            '<div class="num">' + String(ni + 1).padStart(2, '0') + '</div>' +
+            '<div class="head"><h3>' + esc(n.titulo) + '</h3><div class="badges">' + nBadges(n) + '</div></div>' +
+            (n.sintese ? '<div class="sint">' + esc(n.sintese) + '</div>' : '') +
+            body +
+            (pills ? '<div class="foot">' + pills + '</div>' : '') +
+          '</article>';
+        }).join('') + '</div>');
+      }
+      if (list.length) {
+        const tag = DATA.meta.ai_curated ? 'curadoria por IA' : 'mais relevantes';
+        parts.push('<h2 class="sec-inline">✨ Destaques do dia <span class="sec-tag">' + tag + '</span></h2>');
+      }
+      grid.innerHTML = parts.join('') + list.map(cardHTML).join('');
+      empty.hidden = list.length !== 0 || showNarr;
+      parseEmoji(grid);
+      return;
+    }
+    {
+      // Temas cumulativos (E/interseção): artigo só entra se tiver TODOS os
+      // temas selecionados. Combina com origem/jornal/busca.
+      list = articles.filter(a =>
+        [...activeThemes].every(t => a.themes.includes(t)) && matchFilters(a));
+      // Ordem em cada seção (sort estável; base = relevância):
+      //  0) Brasil em 1º lugar E o tema da seção em 2º;
+      //  1) tema da seção em 1º lugar;
+      //  2) o resto. Destaque é desempate interno.
+      list.sort((x, y) => (hlLinks.has(y.link) ? 1 : 0) - (hlLinks.has(x.link) ? 1 : 0));
+      if (activeThemes.size) {
+        const srank = a =>
+          (a.themes[0] === 'brasil' && activeThemes.has(a.themes[1])) ? 0
+          : activeThemes.has(a.themes[0]) ? 1 : 2;
+        list.sort((x, y) => srank(x) - srank(y));
+        // Seção Opiniões: análises estratégicas de geopolítica, diplomacia
+        // e governança de IA no topo (não opiniões sobre temas leves).
+        if (activeThemes.has('opiniao')) {
+          const STRAT = new Set(['diplomacia', 'geopolitica', 'ia_governanca', 'seguranca_internacional', 'brasil', 'comercio']);
+          list.sort((x, y) =>
+            (y.themes.some(t => STRAT.has(t)) ? 1 : 0) - (x.themes.some(t => STRAT.has(t)) ? 1 : 0));
+        }
+      } else {
+        // "Todos": matérias com a tag Brasil primeiro
+        list.sort((x, y) => (y.themes.includes('brasil') ? 1 : 0) - (x.themes.includes('brasil') ? 1 : 0));
+      }
+      viewTitle.hidden = true;
+    }
+    grid.innerHTML = list.map(cardHTML).join('');
+    empty.hidden = list.length !== 0;
+    parseEmoji(grid);
+  }
+
+  // recomputa o "tempo atrás" no cliente (mais preciso que no build)
+  for (const a of articles) a.time_ago = a.published ? timeAgo(a.published) : '';
+  for (const a of HL) a.time_ago = a.published ? timeAgo(a.published) : '';
+
+  document.getElementById('q').addEventListener('input', e => { query = e.target.value; render(); });
+  render();
+  parseEmoji(document.body);
+  // Re-parseia quando o Twemoji terminar de carregar (CDN assíncrono)
+  window.addEventListener('load', () => parseEmoji(document.body));
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------- #
+# Camada de IA (Gemini) — opcional, com fallback
+# --------------------------------------------------------------------------- #
+DIPLOMAT_PERSONA = (
+    "Você é uma DIPLOMATA BRASILEIRA do Ministério das Relações Exteriores, "
+    "lotada no Departamento de Ciência, Tecnologia e Inovação (DCTEC). Sua "
+    "função é monitorar o noticiário internacional sobre INTELIGÊNCIA "
+    "ARTIFICIAL e POLÍTICA EXTERNA e selecionar o que interessa ao Brasil e "
+    "à sua inserção internacional. Pense e selecione COMO diplomata, "
+    "priorizando:\n"
+    "- o Brasil e sua posição em IA e política externa (governo, diplomacia, "
+    "empresas e iniciativas brasileiras);\n"
+    "- os grandes eixos da governança global de IA: regulação, segurança, "
+    "ética, cúpulas multilaterais e disputas regulatórias entre potências;\n"
+    "- os movimentos estratégicos da política externa mundial: diplomacia, "
+    "multilateralismo, geopolítica entre grandes potências (EUA, China, "
+    "União Europeia, Rússia), comércio, sanções e controles de exportação, e "
+    "conflitos/segurança internacional;\n"
+    "- e SEMPRE os grandes lançamentos e disputas da INDÚSTRIA de IA "
+    "(modelos, investimentos, chips) que possam afetar o cenário "
+    "estratégico.\n"
+    "Analise o SENTIDO de cada manchete (não palavras isoladas)."
+)
+
+
+SCORE_RUBRIC = (
+    "Dê uma nota 0-100 de RELEVÂNCIA EDITORIAL para uma diplomata brasileira "
+    "que acompanha IA e política externa. LEIA o conteúdo e pergunte-se "
+    "quanto aquilo de fato INFORMA essa diplomata — julgue por importância e "
+    "substância, NÃO por fórmula nem por simples menção.\n"
+    "ALTA (75-100): qualquer coisa envolvendo o Brasil (governo, diplomacia, "
+    "empresas, IA nacional); grandes decisões de GOVERNANÇA de IA (regulação, "
+    "cúpulas, acordos internacionais); movimentos estratégicos de "
+    "GEOPOLÍTICA e DIPLOMACIA entre grandes potências; sanções, controles de "
+    "exportação e disputas comerciais de peso (chips, semicondutores); "
+    "conflitos e crises de segurança internacional; e grandes ANÁLISES / "
+    "artigos de REFLEXÃO estratégica sobre IA ou a ordem internacional.\n"
+    "MÉDIA (40-74): notícia setorial de IA (lançamento de produto, rodada de "
+    "investimento, avanço técnico) ou de política externa de interesse, "
+    "porém mais rotineira ou de menor alcance.\n"
+    "BAIXA (0-39): notas de produto sem repercussão estratégica, rumores de "
+    "mercado, curiosidades tecnológicas, boletins de bolsa/ações e conteúdo "
+    "promocional — INCLUSIVE quando citam o Brasil de passagem. Uma MENÇÃO "
+    "ao Brasil NÃO garante nota alta: pese a importância real.\n"
+    "EQUILÍBRIO POR TEMA: em IA, distribua a importância entre modelos/"
+    "pesquisa, governança/regulação, indústria/investimento e uso militar/"
+    "segurança conforme o peso da NOTÍCIA específica — não privilegie um "
+    "sub-tema automaticamente. Em política externa, cubra diplomacia, "
+    "geopolítica, comércio/sanções e conflitos de forma equilibrada.\n"
+    "Notícia sem ligação real com IA, política externa ou o Brasil é "
+    "irrelevante (0-15). Use notas DISTINTAS para refletir a ordem."
+)
+
+
+EDITOR_PROMPT = (
+    DIPLOMAT_PERSONA + "\n\n"
+    "Abaixo está uma lista pré-selecionada de matérias do dia sobre IA e "
+    "política externa. Atue como o EDITOR de clipping do Itamaraty e escolha "
+    "de 6 a 9 DESTAQUES — os itens mais IMPORTANTES e INFORMATIVOS do dia "
+    "para uma diplomata brasileira. É uma seleção criteriosa e cautelosa, "
+    "lendo cada matéria.\n"
+    "Critérios:\n"
+    "- IMPORTÂNCIA acima de menção: um lançamento de produto rotineiro ou "
+    "uma simples menção ao Brasil NÃO entra só por isso — entra se for de "
+    "real destaque. Ex.: um acordo de regulação de IA na União Europeia "
+    "importa muito mais que o lançamento de mais um aplicativo de "
+    "produtividade com IA (embora este POSSA entrar se for mesmo "
+    "relevante).\n"
+    "- COBERTURA do que mais informa: grandes fatos de governança e "
+    "segurança de IA, geopolítica e diplomacia entre grandes potências, "
+    "comércio/sanções/controles de exportação, conflitos e segurança "
+    "internacional, e o Brasil nesse cenário.\n"
+    "- DIVERSIDADE: não encha de um só tema nem repita o mesmo fato/assunto; "
+    "varie. Não selecione vários itens quase idênticos.\n"
+    "- VALORIZE grandes ANÁLISES e artigos de REFLEXÃO estratégica sobre IA "
+    "ou a ordem internacional — essas peças costumam informar muito sobre "
+    "tendências e estratégia.\n\n"
+    "Responda APENAS em JSON, em ordem editorial (mais relevante primeiro): "
+    '{"destaques": [{"i": <índice>, "resumo": "<1 frase factual em PT, máx. 160>"}]}.\n\n'
+    "Matérias:\n"
+)
+
+
+NARRATIVES_PROMPT = (
+    DIPLOMAT_PERSONA + "\n\n"
+    "Leia o conjunto de matérias do dia e identifique os PRINCIPAIS TEMAS "
+    "ESTRATÉGICOS do noticiário mundial de IA e política externa hoje — os "
+    "assuntos-chave que uma diplomata brasileira precisa conhecer. Seja "
+    "ESTRITAMENTE FACTUAL: relate o que as matérias dizem, sem tese, sem "
+    "interpretação, sem exagero.\n"
+    "Devolva:\n"
+    '- "quadro": parágrafo de abertura (2 a 3 frases, em português) FACTUAL '
+    "com os principais fatos do dia no noticiário de IA e política externa "
+    "— sem adjetivação nem leitura interpretativa.\n"
+    '- "narrativas": de 3 a 6 temas, ORDENADOS DO MAIS ESTRATÉGICO PARA O '
+    "MENOS. O peso estratégico se mede por CONSEQUÊNCIA, não por assunto: "
+    "quanto o fato altera (ou pode alterar) o cenário internacional de IA, a "
+    "política externa das grandes potências ou os interesses do Brasil. "
+    "Julgue o dia pelo que ELE trouxe — os temas fortes mudam a cada dia e "
+    "NÃO existe lista fixa de assuntos 'estratégicos'. Fatos protocolares, "
+    "cerimoniais ou de rotina setorial ficam por último (ou fora).\n"
+    "COBERTURA: a seleção deve espelhar o dia INTEIRO — tanto os grandes "
+    "temas de governança/indústria de IA quanto os movimentos de diplomacia, "
+    "geopolítica e segurança internacional. Havendo um grande avanço técnico "
+    "ou comercial em IA, ao menos UM tema deve registrá-lo. Cada tema com:\n"
+    '  - "titulo": título curto FACTUAL e descritivo em português (máx. 8 '
+    "palavras) — descreva o fato central como uma manchete sóbria, NUNCA uma "
+    "tese (ex.: 'UE aprova nova regra de transparência para IA', não 'IA "
+    "muda o mundo');\n"
+    '  - "texto": 2 a 4 frases em português com os FATOS que compõem o tema '
+    "(quem, o quê, quando, números) — sem opinião;\n"
+    '  - "temas": chaves de tema envolvidas, entre: brasil, ia_modelos, '
+    "ia_governanca, ia_industria, ia_seguranca, diplomacia, geopolitica, "
+    "seguranca_internacional, comercio, opiniao;\n"
+    '  - "itens": índices (números) de 2 a 4 matérias da lista que sustentam '
+    "a narrativa;\n"
+    '  - "busca": consulta de 3 a 6 palavras EM INGLÊS para aprofundar esta '
+    "narrativa numa busca no Google News (termos específicos do fato, não "
+    "genéricos).\n"
+    "Tom de nota diplomática: analítico, sóbrio, sem sensacionalismo. Baseie-se "
+    "APENAS nas matérias listadas — não invente fatos.\n"
+    'Responda APENAS em JSON: {"quadro": "...", "narrativas": [{"titulo": '
+    '"...", "texto": "...", "temas": ["..."], "itens": [0, 1], "busca": "..."}]}.\n\n'
+)
+
+
+def _prev_narratives(max_days: int = 2) -> str:
+    """Narrativas das edições anteriores (snapshots do history/), para dar
+    memória editorial ao analista: evitar repetição e criar continuidade."""
+    hist_dir = os.environ.get("HISTORY_DIR", "history")
+    brt = timezone(timedelta(hours=-3))
+    today = datetime.now(timezone.utc).astimezone(brt).strftime("%Y-%m-%d")
+    try:
+        files = sorted(
+            (fn for fn in os.listdir(hist_dir)
+             if re.fullmatch(r"data-\d{4}-\d{2}-\d{2}\.json", fn)
+             and fn != f"data-{today}.json"),
+            reverse=True)[:max_days]
+    except OSError:
+        return ""
+    blocks: list[str] = []
+    for fn in reversed(files):  # mais antiga primeiro (ordem cronológica)
+        try:
+            with open(os.path.join(hist_dir, fn), encoding="utf-8") as fh:
+                snap = json.load(fh)
+        except Exception:  # noqa: BLE001
+            continue
+        itens = ((snap or {}).get("narratives") or {}).get("itens") or []
+        if not itens:
+            continue
+        lines = [f"Edição de {fn[5:15]}:"]
+        for it in itens:
+            resumo = (it.get("sintese") or it.get("texto") or "")[:160]
+            lines.append(f"- {it.get('titulo', '')}: {resumo}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+NARRATIVE_REPORT_PROMPT = (
+    DIPLOMAT_PERSONA + "\n\n"
+    "Você identificou os temas do dia e uma PESQUISA ADICIONAL trouxe material "
+    "novo sobre cada um (itens marcados com x). Várias matérias trazem também "
+    "o TEXTO integral (campo TEXTO) — LEIA esses textos: é deles que saem os "
+    "números, valores, datas e nomes exatos. Produza, para CADA tema, um "
+    "briefing ESTRITAMENTE FACTUAL.\n"
+    "O ÚNICO objetivo é INFORMAR com PRECISÃO: munir o diplomata dos fatos, "
+    "nomes, números e datas do dia. NENHUMA análise, NENHUMA interpretação, "
+    "NENHUMA implicação — a análise quem faz é o diplomata. Relate apenas o "
+    "que as matérias dizem; se houver contradição entre elas, registre as "
+    "duas versões; se algo foi cancelado ou negado, diga exatamente isso.\n"
+    "Para cada tema devolva:\n"
+    '- "n": o número do tema;\n'
+    '- "sintese": 1 frase FACTUAL com o fato central (máx. 140 caracteres, '
+    "sem adjetivos de opinião);\n"
+    '- "pontos": 4 a 6 FATOS em bullets telegráficos (máx. 18 palavras cada), '
+    "com o máximo de PRECISÃO: quem disse/decidiu, o quê, quando, quanto "
+    "(números, valores, datas, nomes de pessoas/empresas/órgãos). É o "
+    "conteúdo inteiro do briefing — priorize os fatos mais estratégicos. "
+    "ORDENE em sequência lógica de leitura: o fato principal primeiro, depois "
+    "seus desdobramentos, depois contexto/reações — fatos do mesmo assunto em "
+    "sequência, SEM alternar entre assuntos;\n"
+    '- "extras": índices k dos itens x<n>.<k> da pesquisa adicional que valem '
+    "citar como fonte (até 3; só os realmente pertinentes).\n"
+    "Baseie-se APENAS no material fornecido — não invente nem extrapole "
+    "fatos, números ou datas. Em português, tom sóbrio de nota informativa.\n"
+    'Responda APENAS em JSON: {"narrativas": [{"n": 0, "sintese": "...", '
+    '"pontos": ["..."], "extras": [1]}]}.\n\n'
+    "Material:\n"
+)
+
+
+def _gemini_call(prompt: str, api_key: str, model: str, max_tokens: int,
+                 retries: int = 2, deep: bool = False):
+    """Chama o Gemini e devolve o JSON da resposta. Tenta de novo com backoff
+    em falhas transitórias (429/5xx/rede/JSON truncado); esgotado, relança.
+    deep=True libera raciocínio profundo (para as tarefas analíticas)."""
+    # "Thinking": mínimo nas tarefas em massa (senão gasta tokens e trunca o
+    # JSON); profundo nas analíticas. A API mudou entre gerações: o 2.5 usa
+    # thinkingBudget; o 3.x (3.6 Flash, 3.5 Pro) não aceita budget e usa
+    # thinkingLevel ("low"/"high") — misturar os dois dá 400. Detecta a versão
+    # maior do modelo para escolher o campo certo.
+    _mv = re.match(r"gemini-(\d+)", model)
+    if _mv and int(_mv.group(1)) >= 3:
+        thinking = {"thinkingLevel": "high" if deep else "low"}
+    elif deep:
+        thinking = {"thinkingBudget": 4096}
+    else:
+        thinking = {"thinkingBudget": 0}
+    body = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "response_mime_type": "application/json",
+            "maxOutputTokens": max_tokens,
+            "thinkingConfig": thinking,
+        },
+    }).encode("utf-8")
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent")
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                url, data=body,
+                headers={"Content-Type": "application/json",
+                         "x-goog-api-key": api_key,
+                         "User-Agent": USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                raw = json.loads(resp.read())
+            return json.loads(raw["candidates"][0]["content"]["parts"][0]["text"])
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            if attempt < retries:
+                time.sleep(3 * (attempt + 1))
+    raise last_err
+
+
+def _claude_call(prompt: str, api_key: str, max_tokens: int, retries: int = 1):
+    """Chama o Claude (API da Anthropic) e devolve o JSON da resposta. Usado
+    nas Narrativas quando ANTHROPIC_API_KEY está configurada — modelo de ponta
+    com raciocínio adaptativo. HTTP puro (stdlib), como o resto do projeto."""
+    model = os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8")
+    body = json.dumps({
+        "model": model,
+        "max_tokens": max_tokens,
+        # Raciocínio adaptativo: o modelo decide quanto pensar (tarefa analítica)
+        "thinking": {"type": "adaptive"},
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages", data=body,
+                headers={"Content-Type": "application/json",
+                         "x-api-key": api_key,
+                         "anthropic-version": "2023-06-01",
+                         "User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                raw = json.loads(resp.read())
+            if raw.get("stop_reason") == "refusal":
+                raise RuntimeError("recusa do modelo")
+            text = next(b["text"] for b in raw.get("content", [])
+                        if b.get("type") == "text")
+            # Tolera texto/cercas de markdown em volta do JSON
+            start, end = text.find("{"), text.rfind("}")
+            if start == -1 or end == -1:
+                raise ValueError("resposta sem JSON")
+            return json.loads(text[start:end + 1])
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            if attempt < retries:
+                time.sleep(5)
+    raise last_err
+
+
+def _resolve_gnews(url: str) -> str | None:
+    """Links de busca do Google News são redirecionadores; descobre a URL real
+    do veículo. Tenta padrões diretos na página e, no formato novo, decodifica
+    via a API interna (batchexecute) que o próprio redirecionador usa."""
+    if "news.google.com" not in url:
+        return url
+    raw = fetch(url, timeout=15, ua=BROWSER_UA)
+    if not raw:
+        return None
+    page = raw.decode("utf-8", "ignore")
+    for pat in (r'data-n-au="(https?://[^"]+)"',
+                r'<a[^>]+rel="nofollow[^"]*"[^>]+href="(https?://[^"]+)"'):
+        m = re.search(pat, page)
+        if m and "news.google.com" not in m.group(1):
+            return html.unescape(m.group(1))
+    # Formato novo: assinatura + timestamp ficam na página; a decodificação é
+    # um POST na API interna do Google News.
+    m_id = re.search(r"articles/([^?/&]+)", url)
+    m_sg = re.search(r'data-n-a-sg="([^"]+)"', page)
+    m_ts = re.search(r'data-n-a-ts="([^"]+)"', page)
+    if not (m_id and m_sg and m_ts):
+        return None
+    try:
+        inner = json.dumps([
+            "garturlreq",
+            [["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1,
+              None, None, None, None, None, 0, 1], "X", "X", 1, [1, 1, 1],
+             1, 1, None, 0, 0, None, 0],
+            m_id.group(1), int(m_ts.group(1)), m_sg.group(1),
+        ])
+        body = urllib.parse.urlencode(
+            {"f.req": json.dumps([[["Fbv4je", inner, None, "generic"]]])}
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+            data=body,
+            headers={"Content-Type":
+                     "application/x-www-form-urlencoded;charset=UTF-8",
+                     "User-Agent": BROWSER_UA})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            out = resp.read().decode("utf-8", "ignore")
+        idx = out.find("garturlres")
+        if idx != -1:
+            m = re.search(r'https?://[^"\\\s]+', out[idx:])
+            if m and "news.google.com" not in m.group(0):
+                return m.group(0)
+    except Exception:  # noqa: BLE001 — decodificação é bônus
+        pass
+    return None
+
+
+def _extract_body(page: str) -> str:
+    """Extrai o corpo do artigo de uma página HTML, por ordem de qualidade:
+    1) articleBody do JSON-LD (muitos portais embutem o texto INTEGRAL para
+       SEO, mesmo quando a página visível tem paywall/JS);
+    2) parágrafos dentro de <article> (ou da página toda)."""
+    for m in re.finditer(r"(?is)<script[^>]+ld\+json[^>]*>(.*?)</script>", page):
+        try:
+            data = json.loads(m.group(1).strip())
+        except Exception:  # noqa: BLE001
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            it = stack.pop()
+            if not isinstance(it, dict):
+                continue
+            if isinstance(it.get("@graph"), list):
+                stack.extend(it["@graph"])
+            bodytxt = it.get("articleBody")
+            if isinstance(bodytxt, str) and len(bodytxt) > 300:
+                return strip_html(html.unescape(bodytxt))
+    cleaned = re.sub(r"(?is)<(script|style|noscript|header|footer|nav|aside)"
+                     r"[^>]*>.*?</\1>", " ", page)
+    m = re.search(r"(?is)<article[^>]*>(.*?)</article>", cleaned)
+    scope = m.group(1) if m else cleaned
+    paras = [strip_html(p) for p in re.findall(r"(?is)<p[^>]*>(.*?)</p>", scope)]
+    text = " ".join(p for p in paras if len(p) > 60)
+    return text if len(text) > 300 else ""
+
+
+def _article_fulltext(url: str, max_chars: int = 4000) -> str:
+    """Baixa a matéria e extrai o texto principal. Escada de tentativas:
+    página normal (JSON-LD → <article>) → versão AMP (estática). Melhor
+    esforço: devolve '' quando nada rende texto de verdade."""
+    try:
+        resolved = _resolve_gnews(url)
+        if not resolved:
+            return ""
+        raw = fetch(resolved, timeout=15, ua=BROWSER_UA)
+        if not raw or len(raw) > 3_000_000:
+            return ""
+        page = raw.decode("utf-8", "ignore")
+        text = _extract_body(page)
+        if not text:
+            # Versão AMP: HTML estático, costuma escapar de paywall de JS
+            m = (re.search(r'<link[^>]+rel="amphtml"[^>]+href="([^"]+)"', page)
+                 or re.search(r'<link[^>]+href="([^"]+)"[^>]+rel="amphtml"', page))
+            if m:
+                amp_url = urllib.parse.urljoin(resolved, html.unescape(m.group(1)))
+                raw2 = fetch(amp_url, timeout=15, ua=BROWSER_UA)
+                if raw2 and len(raw2) <= 3_000_000:
+                    text = _extract_body(raw2.decode("utf-8", "ignore"))
+        return text[:max_chars] if len(text) > 300 else ""
+    except Exception:  # noqa: BLE001 — leitura integral é bônus, nunca quebra
+        return ""
+
+
+def _openai_call(prompt: str, api_key: str, max_tokens: int, retries: int = 1):
+    """Chama a API da OpenAI (GPT-5.6 Sol) e devolve o JSON da resposta. Usada
+    nas Narrativas quando OPENAI_API_KEY está configurada."""
+    model = os.environ.get("OPENAI_MODEL", "gpt-5.6-sol")
+    body = json.dumps({
+        "model": model,
+        "max_completion_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions", data=body,
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {api_key}",
+                         "User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                raw = json.loads(resp.read())
+            text = raw["choices"][0]["message"]["content"]
+            start, end = text.find("{"), text.rfind("}")
+            if start == -1 or end == -1:
+                raise ValueError("resposta sem JSON")
+            return json.loads(text[start:end + 1])
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            if attempt < retries:
+                time.sleep(5)
+    raise last_err
+
+
+def _pick_pro_model(api_key: str, fallback: str) -> str:
+    """Escolhe o melhor modelo Pro DISPONÍVEL para a conta, consultando a
+    própria API (evita 404 por chutar nome de modelo). Respeita a env
+    GEMINI_MODEL_NARRATIVES quando definida; sem Pro disponível, usa o padrão."""
+    env = os.environ.get("GEMINI_MODEL_NARRATIVES")
+    if env:
+        return env
+    names: list[str] = []
+    try:
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+            headers={"x-goog-api-key": api_key, "User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+        for m in data.get("models", []):
+            if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                names.append(m.get("name", "").removeprefix("models/"))
+    except Exception:  # noqa: BLE001 — sem lista, fica o fallback
+        return fallback
+    # Preferência: "gemini-X.Y-pro" estável de maior versão; senão variantes.
+    best, best_v = None, -1.0
+    for pat in (r"gemini-(\d+(?:\.\d+)?)-pro", r"gemini-(\d+(?:\.\d+)?)-pro[\w.-]*"):
+        for name in names:
+            m = re.fullmatch(pat, name)
+            if m:
+                v = float(m.group(1))
+                if v > best_v:
+                    best, best_v = name, v
+        if best:
+            break
+    return best or fallback
+
+
+def gemini_enrich(articles: list[dict], now: datetime) -> tuple[list[dict], dict | None]:
+    """A IA comanda o ranqueamento e a curadoria. Três chamadas ao Gemini:
+      1) lê e pontua um conjunto amplo por relevância editorial + recategoriza
+         os temas (ordena cada seção);
+      2) CURADORIA editorial dos Destaques — seleciona, com juízo de
+         importância e diversidade, lendo as matérias (não top-N mecânico);
+      3) NARRATIVAS DO DIA — síntese analítica das principais narrativas e
+         chaves de leitura, conectando as matérias (aba própria no painel).
+    Define a["ai_score"], a["themes"] e (nos destaques) a["ai_summary_text"];
+    retorna (destaques, narrativas). Falha graciosamente para o heurístico.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key or not articles:
+        if not api_key:
+            print("  (Gemini desativado: sem GEMINI_API_KEY — usando ranking heurístico)")
+        return [], None
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+
+    # Cobertura ampla: topo global + até 40 por tema => a IA pontua (e ordena)
+    # cada seção, não só os destaques. O heurístico fica só como desempate.
+    candidates: list[dict] = []
+    seen_ids: set[int] = set()
+
+    def _add(a: dict) -> None:
+        if id(a) not in seen_ids:
+            seen_ids.add(id(a))
+            candidates.append(a)
+
+    for a in articles[:90]:
+        _add(a)
+    for theme in THEMES:
+        c = 0
+        for a in articles:
+            if theme in a["themes"]:
+                _add(a)
+                c += 1
+                if c >= 60:
+                    break
+    candidates = candidates[:420]
+
+    # ---- Chamada 1: NOTA + TEMAS (a IA entende o texto e recategoriza) ----
+    # Em LOTES: respostas menores não truncam, e a falha de um lote não
+    # derruba a avaliação dos demais.
+    prompt_header = (
+        DIPLOMAT_PERSONA + "\n\n"
+        "Temas válidos (use estas CHAVES exatas):\n"
+        "  brasil = menções ao Brasil (governo, diplomacia, Itamaraty, "
+        "empresas ou iniciativas brasileiras) no contexto de IA ou política "
+        "externa; ia_modelos = modelos de IA, pesquisa, avanços técnicos, "
+        "LLMs, IA generativa; ia_governanca = regulação, governança, "
+        "segurança, ética e políticas públicas de IA (leis, cúpulas, acordos "
+        "internacionais sobre IA); ia_industria = indústria de IA: empresas, "
+        "investimentos, produtos, chips, infraestrutura, mercado; "
+        "ia_seguranca = uso militar/de defesa de IA, armas autônomas, guerra "
+        "cibernética, segurança nacional ligada a tecnologia; diplomacia = "
+        "diplomacia, multilateralismo, ONU, G7/G20/BRICS, tratados, cúpulas, "
+        "relações bilaterais; geopolitica = disputas e alinhamentos entre "
+        "grandes potências (EUA, China, União Europeia, Rússia), ordem "
+        "mundial, competição estratégica; seguranca_internacional = guerras, "
+        "conflitos armados, terrorismo, crises de segurança internacional; "
+        "comercio = comércio internacional, tarifas, sanções, controles de "
+        "exportação (inclusive de chips/semicondutores), acordos comerciais; "
+        "opiniao = artigo de OPINIÃO, análise, editorial, coluna ou reflexão "
+        "estratégica (use EM ADIÇÃO ao(s) tema(s) factual(is), quando o texto "
+        "for analítico/opinativo, não uma notícia factual).\n\n"
+        "Para CADA item, devolva:\n"
+        "- \"temas\": lista das CHAVES que REALMENTE se aplicam ao conteúdo. "
+        "Entenda o contexto: uma reportagem sobre um aplicativo de IA sem "
+        "repercussão estratégica NÃO deve levar nota alta mesmo que caia em "
+        "ia_modelos; 'chip de celular comum' NÃO é comercio a menos que "
+        "envolva controle de exportação; um artigo sobre eleição interna de "
+        "um país sem relação com IA ou política externa NÃO se encaixa em "
+        "nenhum tema aqui. Se não se encaixar em nenhum tema de interesse do "
+        "Itamaraty, use []. ORDENE os temas do MAIS CENTRAL (o que melhor "
+        "define o assunto principal da notícia) para o menos central.\n"
+        "- \"evento\": rótulo curto e CANÔNICO em inglês (3 a 6 palavras) que "
+        "identifica o FATO central — IDÊNTICO para matérias sobre o mesmo "
+        "acontecimento, mesmo de veículos/manchetes diferentes (ex.: para "
+        "várias matérias sobre a aprovação do AI Act europeu, use sempre 'EU "
+        "AI Act approval').\n"
+        "- \"score\": " + SCORE_RUBRIC + "\n\n"
+        'Responda APENAS em JSON, sem texto fora dele: '
+        '{"itens": {"<i>": {"temas": ["..."], "evento": "...", "score": <0-100>}}}.\n\n'
+        'Cada item vem como `i: "título" — fonte :: resumo`. CONSIDERE também '
+        'o resumo (ex.: o Brasil pode ser citado só no resumo, não no título).\n\n'
+    )
+    BATCH = 80
+    itens: dict = {}
+    for start in range(0, len(candidates), BATCH):
+        batch = candidates[start:start + BATCH]
+        listing = "\n".join(
+            f'{i}: "{a["title"]}" — {a["source"]}'
+            + (f' :: {a["summary"][:200]}' if a["summary"] else "")
+            for i, a in enumerate(batch, start=start)
+        )
+        try:
+            result = _gemini_call(prompt_header + f"Itens:\n{listing}",
+                                  api_key, model, 32768)
+            itens.update(result.get("itens", {}) or {})
+        except Exception as exc:  # noqa: BLE001 — lote perdido, segue o jogo
+            print(f"  ! Gemini (lote {start}-{start + len(batch) - 1}) falhou "
+                  f"({str(exc)[:60]})")
+    if not itens:
+        print("  ! Gemini indisponível — usando ranking heurístico")
+        return [], None
+
+    n_scored = 0
+    for k, v in itens.items():
+        try:
+            idx = int(k)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(candidates)) or not isinstance(v, dict):
+            continue
+        try:
+            candidates[idx]["ai_score"] = max(0, min(100, int(v.get("score"))))
+            n_scored += 1
+        except (TypeError, ValueError):
+            pass
+        ev = v.get("evento")
+        if isinstance(ev, str) and ev.strip():
+            candidates[idx]["event_toks"] = title_tokens(ev)
+        # Recategorização inteligente: a IA decide os temas reais da matéria,
+        # ordenados do MAIS CENTRAL para o menos (preserva a ordem da IA).
+        temas = v.get("temas")
+        if isinstance(temas, list):
+            candidates[idx]["themes"] = [t for t in dict.fromkeys(temas) if t in THEMES]
+
+    # Só veículos RECONHECIDOS (não "presumidos") com tema válido.
+    scored = [a for a in candidates
+              if "ai_score" in a and a["themes"] and is_trusted(a["source"])]
+    scored.sort(key=lambda a: (a["ai_score"], a["priority"]), reverse=True)
+
+    # ---- Chamada 2: CURADORIA EDITORIAL dos Destaques ----
+    # Em vez de pegar mecanicamente o top-N por nota (o que faria toda matéria
+    # de Brasil dominar), a IA atua como editor e SELECIONA, com diversidade e
+    # juízo de importância. Pool diverso: top global + alguns de cada tema.
+    pool: list[dict] = []
+    pool_ids: set[int] = set()
+
+    def _pool(a: dict) -> None:
+        if id(a) not in pool_ids:
+            pool_ids.add(id(a))
+            pool.append(a)
+
+    for a in scored[:28]:
+        _pool(a)
+    for theme in THEMES:
+        c = 0
+        for a in scored:
+            if theme in a["themes"]:
+                _pool(a)
+                c += 1
+                if c >= 9:
+                    break
+    pool = pool[:70]
+
+    highlights: list[dict] = []
+    if pool:
+        listing = "\n".join(
+            f'{i}: "{a["title"]}" — {a["source"]} [{", ".join(a["themes"])}]'
+            + (f' :: {a["summary"][:180]}' if a["summary"] else "")
+            for i, a in enumerate(pool)
+        )
+        try:
+            res = _gemini_call(EDITOR_PROMPT + listing, api_key, model, 4096)
+            chosen: set[int] = set()
+            for d in (res.get("destaques", []) or [])[:9]:
+                try:
+                    i = int(d.get("i"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= i < len(pool) and i not in chosen:
+                    chosen.add(i)
+                    art = pool[i]
+                    resumo = d.get("resumo")
+                    if isinstance(resumo, str) and resumo.strip():
+                        art["ai_summary_text"] = resumo.strip()
+                    highlights.append(art)
+        except Exception as exc:  # noqa: BLE001 — fallback: top por nota
+            print(f"  ! Gemini (curadoria) falhou ({str(exc)[:60]}) — top por nota")
+    if not highlights:
+        highlights = scored[:8]
+
+    # ---- Chamada 3: NARRATIVAS DO DIA (síntese analítica) ----
+    # A IA conecta as matérias do pool em narrativas com chaves de leitura.
+    # É UMA chamada por dia, a mais analítica de todas — usa o modelo mais
+    # inteligente (Pro) com raciocínio profundo; se ele falhar (cota/rede),
+    # cai para o modelo padrão. Sem narrativas, o bloco não aparece.
+    narratives: dict | None = None
+    if pool:
+        model_narr = _pick_pro_model(api_key, model)
+        # Motor das Narrativas: modelo de ponta pago quando a secret existir
+        # (Anthropic tem prioridade se ambas estiverem configuradas); sem
+        # secrets, fica no Gemini Pro (grátis). Fallback sempre para o Gemini.
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        if anthropic_key:
+            top = (os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8"), "Anthropic")
+        elif openai_key:
+            top = (os.environ.get("OPENAI_MODEL", "gpt-5.6-sol"), "OpenAI")
+        else:
+            top = None
+        print(f"  [narrativas] modelo: "
+              + (f"{top[0]} ({top[1]}; fallback {model_narr})" if top else model_narr))
+
+        def _narr_call(prompt: str, toks: int):
+            """Cadeia analítica: modelo de ponta (se houver) → Gemini Pro → padrão."""
+            if top:
+                try:
+                    call = _claude_call if top[1] == "Anthropic" else _openai_call
+                    key = anthropic_key if top[1] == "Anthropic" else openai_key
+                    return call(prompt, key, toks)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  ! {top[0]} falhou ({str(exc)[:60]}) — "
+                          f"tentando {model_narr}")
+            try:
+                return _gemini_call(prompt, api_key, model_narr, toks, deep=True)
+            except Exception as exc:  # noqa: BLE001
+                if model_narr == model:
+                    raise
+                print(f"  ! Gemini narrativas com {model_narr} falhou "
+                      f"({str(exc)[:60]}) — tentando {model}")
+                return _gemini_call(prompt, api_key, model, toks)
+
+        listing = "\n".join(
+            f'{i}: "{a["title"]}" — {a["source"]} [{", ".join(a["themes"])}]'
+            + (f' :: {a["summary"][:180]}' if a["summary"] else "")
+            for i, a in enumerate(pool)
+        )
+        try:
+            # Memória editorial: narrativas das 2 edições anteriores entram
+            # como contexto — evita repetir "novidade" requentada e permite
+            # registrar EVOLUÇÃO quando o assunto continua.
+            prev_ctx = _prev_narratives()
+            if prev_ctx:
+                print("  [narrativas] contexto: edições anteriores carregadas")
+                id_prompt = (NARRATIVES_PROMPT
+                             + "CONTEXTO — temas das edições anteriores deste "
+                               "painel:\n" + prev_ctx + "\n\n"
+                               "Use o contexto assim: NÃO selecione como tema "
+                               "do dia um assunto já reportado que NÃO tenha "
+                               "fato novo hoje; quando o assunto CONTINUA com "
+                               "desdobramento real, selecione-o registrando a "
+                               "EVOLUÇÃO (o texto deve deixar claro o que é "
+                               "NOVO em relação ao já reportado).\n\n")
+            else:
+                id_prompt = NARRATIVES_PROMPT
+            res = _narr_call(id_prompt + "Matérias do dia:\n" + listing, 16384)
+            out = []
+            for n in (res.get("narrativas", []) or [])[:6]:
+                if not isinstance(n, dict):
+                    continue
+                titulo = (n.get("titulo") or "").strip()
+                texto = (n.get("texto") or "").strip()
+                if not titulo or not texto:
+                    continue
+                temas = [t for t in (n.get("temas") or []) if t in THEMES][:4]
+                mats = []
+                for i in (n.get("itens") or [])[:4]:
+                    try:
+                        i = int(i)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= i < len(pool):
+                        a = pool[i]
+                        mats.append({"title": a["title"], "source": a["source"],
+                                     "link": a["link"]})
+                out.append({"titulo": titulo, "texto": texto, "temas": temas,
+                            "materias": mats,
+                            "busca": (n.get("busca") or "").strip()})
+
+            # ---- Aprofundamento: pesquisa adicional específica por narrativa
+            # (Google News Índia, últimos 3 dias) + relatório final sucinto.
+            # Se qualquer etapa falhar, as narrativas básicas permanecem.
+            if out:
+                try:
+                    def _dig(n: dict) -> list[dict]:
+                        q = n.get("busca") or n["titulo"]
+                        url = ("https://news.google.com/rss/search?q="
+                               + urllib.parse.quote(f"{q} when:3d")
+                               + "&hl=en-US&gl=US&ceid=US:en")
+                        raw = fetch(url)
+                        extra: list[dict] = []
+                        if raw:
+                            seen_t = {normalize(m["title"]) for m in n["materias"]}
+                            for it in parse_feed(raw, "Aprofundamento")[:12]:
+                                tnorm = normalize(it["title"])
+                                if tnorm in seen_t:
+                                    continue
+                                seen_t.add(tnorm)
+                                extra.append({
+                                    "title": it["title"],
+                                    "source": canonical_source(it["outlet"]) if it["outlet"] else "",
+                                    "link": it["link"]})
+                                if len(extra) >= 8:
+                                    break
+                        return extra
+
+                    with ThreadPoolExecutor(max_workers=6) as ex2:
+                        extras = list(ex2.map(_dig, out))
+                    n_extra = sum(len(e) for e in extras)
+                    print(f"  [narrativas] aprofundamento: {n_extra} matérias "
+                          f"novas em {len(out)} buscas")
+
+                    # ---- Leitura integral: baixa o TEXTO das matérias-chave
+                    # (não só manchetes) para o briefing sair preciso. Melhor
+                    # esforço: paywall/redirect sem solução ficam só na manchete.
+                    to_read: list[dict] = []
+                    seen_links: set[str] = set()
+                    for n, ex_items in zip(out, extras):
+                        for m2 in (n["materias"] + ex_items[:3]):
+                            if m2["link"] not in seen_links:
+                                seen_links.add(m2["link"])
+                                to_read.append(m2)
+                    with ThreadPoolExecutor(max_workers=8) as ex3:
+                        bodies = list(ex3.map(
+                            lambda m2: _article_fulltext(m2["link"]), to_read))
+                    fulltext = {m2["link"]: t for m2, t in zip(to_read, bodies) if t}
+                    print(f"  [narrativas] leitura integral: {len(fulltext)}/"
+                          f"{len(to_read)} matérias com texto completo")
+
+                    def _mat_line(tag: str, m2: dict) -> str:
+                        line = f'  {tag}: "{m2["title"]}" — {m2["source"]}'
+                        body = fulltext.get(m2["link"])
+                        if body:
+                            line += f"\n    TEXTO: {body[:2500]}"
+                        return line
+
+                    sec = []
+                    for j, (n, ex_items) in enumerate(zip(out, extras)):
+                        lines = [f'NARRATIVA {j}: {n["titulo"]}',
+                                 f'  contexto: {n["texto"]}']
+                        for k, m2 in enumerate(n["materias"]):
+                            lines.append(_mat_line(f"m{j}.{k}", m2))
+                        for k, m2 in enumerate(ex_items):
+                            lines.append(_mat_line(f"x{j}.{k}", m2))
+                        sec.append("\n".join(lines))
+                    rep = _narr_call(
+                        NARRATIVE_REPORT_PROMPT + "\n\n".join(sec), 16384)
+                    for r in (rep.get("narrativas", []) or []):
+                        if not isinstance(r, dict):
+                            continue
+                        try:
+                            j = int(r.get("n"))
+                        except (TypeError, ValueError):
+                            continue
+                        if not (0 <= j < len(out)):
+                            continue
+                        n = out[j]
+                        sint = (r.get("sintese") or "").strip()
+                        pontos = [str(p).strip() for p in (r.get("pontos") or [])
+                                  if str(p).strip()][:6]
+                        if sint:
+                            n["sintese"] = sint
+                        if pontos:
+                            n["pontos"] = pontos
+                        # Fontes extras escolhidas pelo relatório (cap total 5)
+                        ex_items = extras[j]
+                        for k in (r.get("extras") or [])[:3]:
+                            try:
+                                k = int(k)
+                            except (TypeError, ValueError):
+                                continue
+                            if 0 <= k < len(ex_items) and len(n["materias"]) < 5:
+                                n["materias"].append(ex_items[k])
+                except Exception as exc:  # noqa: BLE001 — fica a versão básica
+                    print(f"  ! aprofundamento das narrativas falhou "
+                          f"({str(exc)[:60]}) — mantendo versão básica")
+
+                for n in out:
+                    n.pop("busca", None)
+                quadro = res.get("quadro")
+                narratives = {"quadro": quadro.strip() if isinstance(quadro, str) else "",
+                              "itens": out}
+        except Exception as exc:  # noqa: BLE001 — bloco opcional, segue sem ele
+            print(f"  ! Gemini (narrativas) falhou ({str(exc)[:60]})")
+
+    print(f"  ✓ Gemini: {n_scored} matérias pontuadas, {len(highlights)} destaques "
+          f"curados, {len(narratives['itens']) if narratives else 0} narrativas")
+    return highlights, narratives
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline principal
+# --------------------------------------------------------------------------- #
+def main() -> int:
+    out_dir = os.environ.get("OUTPUT_DIR", "public")
+    override = os.environ.get("FEEDS_OVERRIDE")
+    feeds = json.loads(override) if override else FEEDS
+
+    now = datetime.now(timezone.utc)
+
+    # Janela de notícias: últimas 24h — mas 48h às SEGUNDAS (para cobrir o fim
+    # de semana), considerando o dia em Brasília (BRT), quando o build roda.
+    # MAX_AGE_DAYS continua disponível só para testes locais (janela maior).
+    BRT = timezone(timedelta(hours=-3))
+    max_age_env = os.environ.get("MAX_AGE_DAYS")
+    if max_age_env:
+        cutoff = now - timedelta(days=int(max_age_env))
+        require_date = False
+        window_h = int(max_age_env) * 24
+    else:
+        window_h = 48 if now.astimezone(BRT).weekday() == 0 else 24
+        cutoff = now - timedelta(hours=window_h)
+        require_date = True
+
+    seen_links: set[str] = set()
+    seen_titles: set[str] = set()
+    seen_clusters: list[dict] = []  # {"tokens": set, "article": dict} p/ quase-dups
+    articles: list[dict] = []
+    ok_sources: set[str] = set()
+
+    # Busca todos os feeds em paralelo (preservando a ordem da lista) — com
+    # ~50 feeds, em série ficaria lento; o ThreadPoolExecutor reduz para ~o
+    # tempo do feed mais lento.
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        raws = list(ex.map(lambda f: fetch(f["url"]), feeds))
+
+    feed_stats: list[dict] = []  # diagnóstico por feed (para o log)
+    for feed, raw in zip(feeds, raws):
+        name = feed["name"]
+        hint = feed.get("themes", [])
+        outlet_default = name.split(" — ")[0]  # ex.: "The Hindu", "Google News"
+        print(f"- {name}")
+        if not raw:
+            feed_stats.append({"feed": name, "ok": False, "itens": 0, "mantidas": 0})
+            continue
+        parsed = parse_feed(raw, name)
+        _kept_before = len(articles)
+        drop = {"antiga": 0, "sem_data": 0, "duplicada": 0, "sem_tema": 0,
+                "lixo_idioma": 0, "fonte": 0}
+        for item in parsed:
+            # Nome do veículo: usa o <source> (Google News) quando houver,
+            # senão o nome-base do feed.
+            outlet = canonical_source(item.get("outlet") or outlet_default)
+
+            # Limpa o título ANTES de gerar a chave de dedupe: o Google News
+            # acrescenta " - Veículo" ao fim, o que impediria a deduplicação
+            # contra o feed próprio do veículo.
+            title = item["title"]
+            if item.get("outlet") and title.endswith(" - " + item["outlet"]):
+                title = title[: -(len(item["outlet"]) + 3)].strip()
+
+            # Descarta boletins/tickers recorrentes e matérias não-inglês
+            if is_junk_title(title) or not is_english(title):
+                drop["lixo_idioma"] += 1
+                continue
+
+            link_key = item["link"].split("?")[0].strip().lower()
+            title_key = normalize(title).strip()
+            if link_key in seen_links or (title_key and title_key in seen_titles):
+                drop["duplicada"] += 1
+                continue
+            # filtro por data: só últimas 24/48 horas
+            if item["published"] is None:
+                if require_date:
+                    drop["sem_data"] += 1
+                    continue
+            elif item["published"] < cutoff:
+                drop["antiga"] += 1
+                continue
+
+            # Buscas agregadas (Google News): SÓ veículos reputados (lista
+            # TRUSTED_OUTLETS). Sites aleatórios/desconhecidos são
+            # descartados — evita ruído nas buscas globais.
+            if item.get("outlet") and not is_trusted(outlet):
+                drop["fonte"] += 1
+                continue
+
+            themes = classify(item, hint)
+            if not themes:
+                drop["sem_tema"] += 1
+                continue  # só interessa o que cai em algum tema
+
+            article = {
+                "title": title,
+                "link": item["link"],
+                "summary": (item["summary"][:320] + "…") if len(item["summary"]) > 320 else item["summary"],
+                "source": outlet,
+                "published": item["published"].isoformat() if item["published"] else None,
+                "themes": themes,
+                "priority": is_priority(outlet),
+                "opinion": "opiniao" in hint,  # veio de fonte de opinião/análise
+            }
+
+            # Quase-duplicata (mesma notícia, veículos/manchetes diferentes):
+            # mantém a versão do veículo de MAIOR porte; senão, a primeira.
+            tok = title_tokens(title)
+            dup = next((c for c in seen_clusters if titles_similar(tok, c["tokens"])), None)
+            if dup is not None:
+                kept = dup["article"]
+                if article["priority"] and not kept["priority"]:
+                    kept.update(article)   # promove a versão do veículo grande
+                    dup["tokens"] = tok
+                drop["duplicada"] += 1
+                continue
+
+            seen_links.add(link_key)
+            if title_key:
+                seen_titles.add(title_key)
+            ok_sources.add(outlet)
+            articles.append(article)
+            seen_clusters.append({"tokens": tok, "article": article})
+        feed_stats.append({"feed": name, "ok": True, "itens": len(parsed),
+                           "mantidas": len(articles) - _kept_before,
+                           "descartes": {k: v for k, v in drop.items() if v}})
+
+    # Ranking heurístico de relevância (determinístico, sem IA). Pondera tema
+    # (foco do DCTEC: Brasil ≫ governança/diplomacia > demais), veículo de
+    # peso, recência e cruzamento de temas.
+    THEME_WEIGHT = {
+        "brasil": 6, "ia_governanca": 4, "diplomacia": 4, "geopolitica": 3,
+        "ia_seguranca": 3, "seguranca_internacional": 3, "comercio": 2,
+        "ia_industria": 2, "ia_modelos": 2, "opiniao": 3,
+    }
+
+    def relevance(a: dict) -> float:
+        s = float(sum(THEME_WEIGHT.get(t, 1) for t in a["themes"]))
+        if len(a["themes"]) > 1:
+            s += 1.5  # bônus por cruzar temas
+        if a["priority"]:
+            s += 3
+        if a["published"]:
+            age_h = (now - datetime.fromisoformat(a["published"])).total_seconds() / 3600
+            s += 3 if age_h <= 24 else (1 if age_h <= 48 else 0)
+        a["score"] = round(s, 1)
+        return s
+
+    articles.sort(key=lambda a: (relevance(a), a["published"] or ""), reverse=True)
+
+    # Camada de IA (opcional): nota de relevância p/ o Itamaraty + resumos em
+    # português + Destaques. Falha graciosamente para o ranking heurístico se a
+    # chave/cota do Gemini não estiver disponível.
+    ai_highlights, ai_narratives = gemini_enrich(articles, now)
+    ai_curated = bool(ai_highlights)
+
+    # Garantia: matérias vindas de fontes de opinião/análise mantêm a tag
+    # 'opiniao' (a IA pode tê-la descartado na recategorização).
+    for a in articles:
+        if a.get("opinion") and "opiniao" not in a["themes"]:
+            a["themes"].append("opiniao")
+
+    # A IA pode ter recategorizado matérias como irrelevantes (temas = []):
+    # removê-las limpa os falsos positivos (ex.: "óleo quente" em Energia).
+    before = len(articles)
+    articles = [a for a in articles if a["themes"]]
+    n_removed_recat = before - len(articles)
+    if n_removed_recat:
+        print(f"  [diag] removidas por recategorização da IA: {n_removed_recat}")
+
+    # Garantia: matéria que cita um sinalizador de Brasil SEMPRE tem tag
+    # 'brasil' (e em destaque, como tema principal) — mesmo que a IA não inclua.
+    for a in articles:
+        if "brasil" not in a["themes"] and mentions_brazil_signal(a["title"] + " " + a["summary"]):
+            a["themes"] = ["brasil"] + a["themes"]
+
+    # Se a IA pontuou os itens, ela passa a comandar a ordenação: notas da IA
+    # primeiro (desc); itens não avaliados seguem pelo ranking heurístico.
+    if any("ai_score" in a for a in articles):
+        articles.sort(key=lambda a: (
+            1 if "ai_score" in a else 0,
+            a.get("ai_score", 0),
+            1 if a["priority"] else 0,   # desempate: veículo grande primeiro
+            a["score"],
+            a["published"] or "",
+        ), reverse=True)
+
+    # Limita (não elimina) a repetição do MESMO FATO: ler de mais jornais é
+    # útil, sobretudo se o evento é importante. Mantém até 2 matérias por
+    # evento — e até 4 quando o evento é importante (nota alta). Usa o rótulo
+    # canônico de evento dado pela IA. Itens sem rótulo são sempre mantidos.
+    n_dup_event = 0
+    if any("event_toks" in a for a in articles):
+        kept, clusters = [], []  # clusters: [{"toks","count","cap"}]
+        for a in articles:
+            ev = a.get("event_toks")
+            if ev and len(ev) >= 2:
+                c = next((c for c in clusters
+                          if len(ev & c["toks"]) >= 3
+                          and len(ev & c["toks"]) / min(len(ev), len(c["toks"])) >= 0.67),
+                         None)
+                if c is None:
+                    cap = 4 if (a.get("ai_score") or 0) >= 85 else 2
+                    clusters.append({"toks": ev, "count": 1, "cap": cap})
+                elif c["count"] < c["cap"]:
+                    c["count"] += 1
+                else:
+                    n_dup_event += 1
+                    continue
+            kept.append(a)
+        articles = kept
+        if n_dup_event:
+            print(f"  [diag] repetições do mesmo evento acima do teto: {n_dup_event}")
+
+    # Destaques sempre presentes na página principal: curadoria da IA quando
+    # disponível; senão, os mais relevantes pelo heurístico. Em ambos os casos,
+    # PREFERÊNCIA ABSOLUTA por veículos reconhecidos (sem sites desconhecidos).
+    highlights = ai_highlights if ai_curated else [a for a in articles if is_trusted(a["source"])][:8]
+
+    # Remove campos transitórios não serializáveis (ex.: event_toks é um set)
+    # antes de gerar o JSON do payload.
+    for a in articles + highlights:
+        a.pop("event_toks", None)
+
+    # Diagnóstico (aparece no log do Actions): mostra a realidade do dia,
+    # tema a tema.
+    for key, meta in THEMES.items():
+        sec = [a for a in articles if key in a["themes"]]
+        if not sec:
+            continue
+        print(f"  [diag] {meta['label']}: {len(sec)} matérias — topo:")
+        for a in sec[:4]:
+            print(f"         score={a.get('ai_score', '-')} | {a['source']} | {a['title'][:64]}")
+
+    # Rótulo de atualização no horário de Brasília (BRT, UTC-3)
+    generated_label = now.astimezone(BRT).strftime("%d/%m/%Y às %H:%M (Brasília)")
+
+    # Guarda de edição vazia: se a coleta falhou em massa (rede, feeds fora do
+    # ar), aborta SEM publicar — o GitHub Pages mantém a edição anterior.
+    # Em testes locais (FEEDS_OVERRIDE) o piso é 0, salvo MIN_ARTICLES.
+    default_min = "0" if override else "30"
+    min_articles = int(os.environ.get("MIN_ARTICLES", default_min))
+    if len(articles) < min_articles:
+        print(f"\n✖ Apenas {len(articles)} matérias (mínimo {min_articles}) — "
+              "abortando para preservar a edição anterior", file=sys.stderr)
+        return 1
+
+    payload = {
+        "meta": {
+            "generated_utc": now.isoformat(),
+            "generated_label": generated_label,
+            "window": f"últimas {window_h} horas",
+            "feeds": sorted(ok_sources, key=str.lower),
+            "ai_curated": ai_curated,
+        },
+        "articles": articles,
+        "highlights": highlights,
+        "narratives": ai_narratives,
+    }
+
+    # ---- Log/diagnóstico do run (para ver o "loop" e melhorar) ----
+    def _slim(a):
+        return {"titulo": a["title"], "fonte": a["source"],
+                "score": a.get("ai_score"), "temas": a["themes"],
+                "resumo": a.get("ai_summary_text", "")}
+    diag = {
+        "gerado": generated_label,
+        "janela_h": window_h,
+        "ia": {"curadoria": ai_curated,
+               "pontuadas": sum(1 for a in articles if "ai_score" in a)},
+        "totais": {"materias": len(articles), "fontes": len(ok_sources),
+                   "removidas_recategorizacao": n_removed_recat,
+                   "repeticoes_evento_removidas": n_dup_event},
+        "feeds": feed_stats,
+        "destaques": [_slim(a) for a in highlights],
+        "narrativas": ai_narratives,
+        "secoes": {k: [_slim(a) for a in articles if k in a["themes"]][:8]
+                   for k in THEMES},
+    }
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---- Histórico rolante de 3 dias (Hoje / Ontem / Anteontem) ----
+    # Cada dia é uma página estática autocontida; o menuzinho são apenas links
+    # entre elas. Os snapshots ficam em history/ (versionado no repositório),
+    # preservados entre execuções pelo passo de commit do workflow.
+    hist_dir = os.environ.get("HISTORY_DIR", "history")
+    today_str = now.astimezone(BRT).strftime("%Y-%m-%d")
+    os.makedirs(hist_dir, exist_ok=True)
+    with open(os.path.join(hist_dir, f"data-{today_str}.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+
+    # Mantém só os 3 snapshots mais recentes; poda os mais antigos.
+    snaps = []
+    for fn in os.listdir(hist_dir):
+        m = re.fullmatch(r"data-(\d{4}-\d{2}-\d{2})\.json", fn)
+        if m:
+            snaps.append((m.group(1), os.path.join(hist_dir, fn)))
+    snaps.sort(reverse=True)
+    for _, path in snaps[3:]:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    snaps = snaps[:3]
+
+    # Monta o menu (rótulos relativos ao dia atual em Brasília) e renderiza
+    # uma página por dia disponível.
+    today_local = now.astimezone(BRT).date()
+    _rel = {0: "Hoje", 1: "Ontem", 2: "Anteontem"}
+    day_menu = []
+    for date_str, path in snaps:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        rel = _rel.get((today_local - d).days)
+        label = f"{rel} ({d.strftime('%d/%m')})" if rel else d.strftime("%d/%m")
+        fname = "index.html" if date_str == today_str else f"h-{date_str}.html"
+        day_menu.append({"label": label, "file": fname,
+                         "_path": path, "_date": date_str})
+
+    for d in day_menu:
+        if d["_date"] == today_str:
+            page_payload = payload
+        else:
+            with open(d["_path"], encoding="utf-8") as fh:
+                page_payload = json.load(fh)
+        # Menu específico da página: a aba ativa é o dia que está sendo renderizado.
+        page_menu = [{**m, "active": m["_date"] == d["_date"]} for m in day_menu]
+        with open(os.path.join(out_dir, d["file"]), "w", encoding="utf-8") as fh:
+            fh.write(render_html(page_payload, page_menu))
+
+    with open(os.path.join(out_dir, "data.json"), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    with open(os.path.join(out_dir, "diag.json"), "w", encoding="utf-8") as fh:
+        json.dump(diag, fh, ensure_ascii=False, indent=2)
+    with open(os.path.join(out_dir, "diag.html"), "w", encoding="utf-8") as fh:
+        fh.write(render_diag(diag, THEMES))
+
+    print(f"\n✔ {len(articles)} matérias de {len(ok_sources)} fontes → {out_dir}/index.html")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
