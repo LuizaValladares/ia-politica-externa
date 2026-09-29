@@ -1,4 +1,3 @@
-
 🤖🌐 IA & Política Externa — Monitor de Notícias
 Dashboard estático, atualizado automaticamente todas as manhãs, com notícias internacionais sobre inteligência artificial e política externa, com recorte de interesse para o Brasil. As matérias são coletadas via RSS de grandes veículos internacionais, classificadas por tema e exibidas em um painel interativo com manchetes, resumos e link de acesso.
 
