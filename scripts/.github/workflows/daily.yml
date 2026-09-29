@@ -1,0 +1,105 @@
+name: Atualização diária do dashboard
+
+on:
+  # Roda todo dia às 11:00 UTC (08:00 em Brasília).
+  schedule:
+    - cron: "0 11 * * *"
+  workflow_dispatch:        # execução manual (Actions → Run workflow)
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/daily.yml"
+
+# Permissões: publicar no GitHub Pages + versionar o histórico de 3 dias
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# Garante uma publicação por vez
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      built: ${{ steps.guard.outputs.skip != 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configurar Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # O cron é só GARANTIA: se a edição de hoje (data de Brasília) já foi
+      # publicada, não há o que fazer. Disparos manuais e por push sempre
+      # geram edição.
+      - name: Garantia — pula se a edição do dia já saiu
+        id: guard
+        if: github.event_name == 'schedule'
+        run: |
+          TODAY=$(TZ=America/Sao_Paulo date +%F)
+          if [ -f "history/data-$TODAY.json" ]; then
+            echo "Edição de $TODAY já publicada — garantia dispensada."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Edição de $TODAY ainda não existe — gerando pela garantia."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Gerar dashboard
+        if: steps.guard.outputs.skip != 'true'
+        run: python3 scripts/build.py
+        env:
+          OUTPUT_DIR: public
+          # Camada de IA opcional. Sem a secret, o build usa só o ranking
+          # heurístico (fallback automático).
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-3.6-flash
+          # Narrativas do dia: modelo Pro do Gemini fixado (evita 404/503 de
+          # modelos indisponíveis na conta grátis — ajuste se preciso).
+          GEMINI_MODEL_NARRATIVES: gemini-3.6-flash
+          # Opcional (APIs pagas): com UMA destas secrets, as Narrativas usam
+          # um modelo de ponta (Anthropic tem prioridade se ambas existirem).
+          # Sem elas, seguem no Gemini (grátis).
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      # Persiste os snapshots de history/ para que o menu de 3 dias (Hoje /
+      # Ontem / Anteontem) sobreviva entre execuções.
+      - name: Persistir histórico (3 dias)
+        if: steps.guard.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add history/
+          git diff --cached --quiet || git commit -m "Histórico: snapshot diário do dashboard"
+          git push
+
+      - name: Configurar Pages
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Enviar artefato
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.built == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publicar no GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
