@@ -843,11 +843,11 @@ TEMPLATE = r"""<!DOCTYPE html>
         <rect x="74" y="188" width="97" height="11" fill="#1e9e3e"/>
         <rect x="171" y="188" width="97" height="11" fill="#ffd200"/>
         <rect x="268" y="188" width="98" height="11" fill="#2b3a8f"/>
-        <text x="220" y="252" text-anchor="middle" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="700" letter-spacing="8">DCTEC</text>
+        <text x="220" y="252" text-anchor="middle" fill="#ffffff" font-family="Arial, Helvetica, sans-serif" font-size="40" font-weight="700" letter-spacing="8">DCT</text>
       </svg>
       <div class="titles">
         <h1>IA & Política Externa</h1>
-        <p class="subtitle">Monitor diário de Inteligência Artificial e Política Externa · Ministério das Relações Exteriores — DCTEC</p>
+        <p class="subtitle">Monitor diário de Inteligência Artificial e Política Externa · Ministério das Relações Exteriores — DCT</p>
       </div>
     </div>
     <div class="stats">
@@ -1150,7 +1150,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 # --------------------------------------------------------------------------- #
 DIPLOMAT_PERSONA = (
     "Você é uma DIPLOMATA BRASILEIRA do Ministério das Relações Exteriores, "
-    "lotada no Departamento de Ciência, Tecnologia e Inovação (DCTEC). Sua "
+    "lotada no Departamento de Ciência, Tecnologia e Inovação (DCT). Sua "
     "função é monitorar o noticiário internacional sobre INTELIGÊNCIA "
     "ARTIFICIAL e POLÍTICA EXTERNA e selecionar o que interessa ao Brasil e "
     "à sua inserção internacional. Pense e selecione COMO diplomata, "
@@ -2103,7 +2103,7 @@ def main() -> int:
                            "descartes": {k: v for k, v in drop.items() if v}})
 
     # Ranking heurístico de relevância (determinístico, sem IA). Pondera tema
-    # (foco do DCTEC: Brasil ≫ governança/diplomacia > demais), veículo de
+    # (foco do DCT: Brasil ≫ governança/diplomacia > demais), veículo de
     # peso, recência e cruzamento de temas.
     THEME_WEIGHT = {
         "brasil": 6, "ia_governanca": 4, "diplomacia": 4, "geopolitica": 3,
